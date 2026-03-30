@@ -1,0 +1,12 @@
+POST :http://localhost:8444/main/ai/index
+
+###
+
+POST https://syrya.com/api/ask
+Content-Type: application/json    
+
+{                                                                                                                                                                                           
+   "question": "Who owns house-123 and what document supports ownership?",                                                                                                                   
+   "entity_id": "house-123",                                                                                                                                                                 
+   "top_k": 5                                                                                                                                                                                
+ }                                                                                                                                                                                           
