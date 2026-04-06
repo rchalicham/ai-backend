@@ -30,3 +30,4 @@ class TemplateSuggestRequest(BaseModel):
     description: str | None = None
     domain_id: str | None = None
     domain_type: str | None = None
+    response_mode: str | None = None

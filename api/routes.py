@@ -108,4 +108,5 @@ async def template_suggest(payload: TemplateSuggestRequest):
         description=payload.description,
         domain_id=payload.domain_id,
         domain_type=payload.domain_type,
+        response_mode=payload.response_mode,
     )

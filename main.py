@@ -1,6 +1,9 @@
+import asyncio
+
 from fastapi import FastAPI
 
 from api.routes import router as api_router
+from api.routes import llm_service
 
 
 app = FastAPI(
@@ -19,6 +22,11 @@ def health() -> dict[str, str]:
 
 app.include_router(api_router, prefix="/api")
 app.include_router(api_router)
+
+
+@app.on_event("startup")
+async def warmup_llm() -> None:
+    asyncio.create_task(llm_service.warmup())
 
 
 if __name__ == "__main__":

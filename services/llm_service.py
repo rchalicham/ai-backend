@@ -18,6 +18,8 @@ class LLMService:
             "http://host.docker.internal:8081/v1/chat/completions",
         )
         self.attribute_catalog_service = AttributeCatalogService()
+        self.request_timeout = float(os.getenv("LLM_TIMEOUT_SECONDS", "120"))
+        self.client = httpx.AsyncClient(timeout=self.request_timeout)
 
     async def ask(self, question: str, chunks: list[dict[str, Any]], graph_context: dict[str, Any]) -> str:
         chunk_context = "\n\n".join(
@@ -54,8 +56,7 @@ class LLMService:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                response = await client.post(self.base_url, json=payload)
+            response = await self.client.post(self.base_url, json=payload)
         except httpx.HTTPError as exc:
             raise HTTPException(status_code=502, detail=f"LLM request failed: {exc}") from exc
 
@@ -79,7 +80,16 @@ class LLMService:
         description: str | None = None,
         domain_id: str | None = None,
         domain_type: str | None = None,
+        response_mode: str | None = None,
     ) -> dict[str, Any]:
+        if (response_mode or "").strip().lower() == "description_only":
+            return await self._suggest_description_only(
+                template_name=template_name,
+                description=description,
+                domain_id=domain_id,
+                domain_type=domain_type,
+            )
+
         candidate_attributes = self.attribute_catalog_service.get_candidate_attributes(
             template_name,
             description,
@@ -108,12 +118,12 @@ class LLMService:
                         "Generate reusable fields for that class of entities, not only for one example item, unless the user explicitly asks for a single-item-specific template. "
                         "Treat the description as user-written design guidance for what the template should capture. "
                         "When the description is present, prioritize it over generic assumptions from the template name. "
-                        "Use the template name as the short domain label, and use the description to determine scope, purpose, and important fields. "
-                        "Always include the configured domain attributes when catalog candidates are provided. "
-                        "Do not invent replacements for configured domain attributes. "
+                        "Use the template name as the short template or category label, and use the description to determine scope, purpose, and important fields. "
+                        "Do not assume any domain-level attribute layer exists. "
+                        "Do not invent or require domain-owned attributes. "
                         "Do not use placeholder names or values such as field_name, attr1, value, A, B, test, sample. "
-                        "Create realistic, reusable attributes for the requested domain. "
-                        "When catalog attribute candidates are provided, select from them first and add only missing category-specific fields. "
+                        "Create realistic, reusable attributes for the requested template, category, entity type, product, or item. "
+                        "When catalog attribute candidates are provided, select from them first and add only missing template-specific fields. "
                         "The description must be exactly 5 non-empty lines and should explain what the template covers, "
                         "how it can be used, and what kinds of attributes are included. "
                         "Write the returned description as reusable knowledge for users who will create entities or products from this template. "
@@ -138,8 +148,7 @@ class LLMService:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                response = await client.post(self.base_url, json=payload)
+            response = await self.client.post(self.base_url, json=payload)
         except httpx.HTTPError as exc:
             raise HTTPException(status_code=502, detail=f"LLM request failed: {exc}") from exc
 
@@ -158,6 +167,161 @@ class LLMService:
             raise HTTPException(status_code=502, detail="LLM response format was unexpected.") from exc
 
         return self._normalize_template_response(content, template_name, description, candidate_attributes, domain_type)
+
+    async def _suggest_description_only(
+        self,
+        template_name: str,
+        description: str | None = None,
+        domain_id: str | None = None,
+        domain_type: str | None = None,
+    ) -> dict[str, Any]:
+        payload = {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You write concise, practical user-facing category or business descriptions. "
+                        "Return ONLY valid JSON with this exact shape: "
+                        "{\"description\":\"plain-language paragraph\"}. "
+                        "Do not include attributes, tags, enum values, template explanations, or any extra keys. "
+                        "Write one concise paragraph with 2 to 4 sentences. "
+                        "Do not repeat the prompt, requirements, or labels verbatim."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Label: {template_name}\n"
+                        f"Domain id: {domain_id or ''}\n"
+                        f"Domain type: {domain_type or ''}\n"
+                        f"Requirements and context: {description or ''}\n"
+                        "Generate the final user-facing description now."
+                    ),
+                },
+            ]
+        }
+
+        try:
+            response = await self.client.post(self.base_url, json=payload)
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"LLM request failed: {exc}") from exc
+
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail="LLM returned invalid JSON.") from exc
+
+        if response.status_code >= 400:
+            detail = body.get("error") if isinstance(body, dict) else body
+            raise HTTPException(status_code=response.status_code, detail=detail)
+
+        try:
+            content = body["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise HTTPException(status_code=502, detail="LLM response format was unexpected.") from exc
+
+        return self._normalize_description_only_response(content, template_name, description, domain_type)
+
+    def _normalize_description_only_response(
+        self,
+        content: str,
+        template_name: str,
+        description: str | None,
+        domain_type: str | None = None,
+    ) -> dict[str, Any]:
+        original_text = (content or "").strip()
+        text = original_text
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end > start:
+            text = text[start:end + 1]
+
+        try:
+            raw = json.loads(text) if text else {}
+        except json.JSONDecodeError:
+            raw = {}
+
+        def normalize(v: Any) -> str:
+            return str(v).strip() if v is not None else ""
+
+        def to_upper_snake(v: str) -> str:
+            out = re.sub(r"[^A-Za-z0-9]+", "_", v).strip("_")
+            return out.upper()
+
+        fallback_bits = []
+        if domain_type:
+            fallback_bits.append(f"This domain supports {normalize(domain_type).lower()} business operations.")
+        fallback_bits.append("It organizes the main business data, workflows, users, and records needed to run the business consistently.")
+        fallback_bits.append("It is intended to provide a clear foundation for structured data entry, operations, and reporting.")
+        fallback_paragraph = " ".join(bit for bit in fallback_bits if bit).strip()
+
+        paragraph = normalize(raw.get("description"))
+        if not paragraph:
+            paragraph = self._extract_description_paragraph(original_text)
+        paragraph = paragraph or fallback_paragraph
+        paragraph = re.sub(r"\s+", " ", paragraph).strip()
+        paragraph = re.sub(r"^\s*[-*]\s*", "", paragraph)
+
+        return {
+            "template_id": "",
+            "template_name": template_name,
+            "description": paragraph,
+            "entity_type": to_upper_snake(domain_type or template_name),
+            "attributes": [],
+            "templateId": "",
+            "templateName": template_name,
+            "entityType": to_upper_snake(domain_type or template_name),
+            "version": 1,
+            "attributesCamelCase": [],
+            "attributes_compat": [],
+            "raw": raw,
+        }
+
+    def _extract_description_paragraph(self, content: str) -> str:
+        text = (content or "").strip()
+        if not text:
+            return ""
+
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+
+        description_match = re.search(
+            r'"description"\s*:\s*"(?P<value>(?:\\.|[^"])*)"',
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if description_match:
+            candidate = description_match.group("value")
+            try:
+                candidate = json.loads(f'"{candidate}"')
+            except json.JSONDecodeError:
+                pass
+            return str(candidate).strip()
+
+        if text.startswith("{") and text.endswith("}"):
+            return ""
+
+        text = re.sub(r"^[\"']|[\"']$", "", text).strip()
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    async def warmup(self) -> None:
+        payload = {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Reply with valid compact JSON only.",
+                },
+                {
+                    "role": "user",
+                    "content": "{\"status\":\"warm\"}",
+                },
+            ]
+        }
+        try:
+            await self.client.post(self.base_url, json=payload)
+        except httpx.HTTPError:
+            return
 
     def _normalize_template_response(
         self,
