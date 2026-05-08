@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException
 
-from models.schemas import AskRequest, CreateRelationshipRequest, IndexRequest, TemplateSuggestRequest
+from models.schemas import AskRequest, CreateRelationshipRequest, IndexRequest, ReceiptStructureRequest, TemplateSuggestRequest
 from services.embedding_service import EmbeddingService
 from services.graph_service import GraphService
 from services.llm_service import LLMService
@@ -109,4 +109,18 @@ async def template_suggest(payload: TemplateSuggestRequest):
         domain_id=payload.domain_id,
         domain_type=payload.domain_type,
         response_mode=payload.response_mode,
+    )
+
+
+@router.post("/receipt/structure")
+async def structure_receipt(payload: ReceiptStructureRequest):
+    raw_text = payload.raw_text.strip()
+    if not raw_text:
+        raise HTTPException(status_code=400, detail="raw_text is required.")
+    return await llm_service.structure_receipt(
+        raw_text=raw_text,
+        lines=payload.lines,
+        parser_json=payload.parser_json,
+        ocr_engine=payload.ocr_engine,
+        ocr_variants=payload.ocr_variants,
     )

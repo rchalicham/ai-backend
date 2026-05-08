@@ -31,3 +31,11 @@ class TemplateSuggestRequest(BaseModel):
     domain_id: str | None = None
     domain_type: str | None = None
     response_mode: str | None = None
+
+
+class ReceiptStructureRequest(BaseModel):
+    raw_text: str
+    lines: list[str] = Field(default_factory=list)
+    parser_json: dict = Field(default_factory=dict)
+    ocr_engine: str | None = None
+    ocr_variants: list[dict] = Field(default_factory=list)
