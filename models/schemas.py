@@ -36,6 +36,28 @@ class TemplateSuggestRequest(BaseModel):
 class ReceiptStructureRequest(BaseModel):
     raw_text: str
     lines: list[str] = Field(default_factory=list)
+    ocr_blocks: list[dict] = Field(default_factory=list)
     parser_json: dict = Field(default_factory=dict)
     ocr_engine: str | None = None
     ocr_variants: list[dict] = Field(default_factory=list)
+
+
+class ReceiptSemanticRequest(BaseModel):
+    raw_text: str = ""
+    lines: list[str] = Field(default_factory=list)
+    ocr_blocks: list[dict] = Field(default_factory=list)
+    parser_json: dict = Field(default_factory=dict)
+    ocr_engine: str | None = None
+    ocr_variants: list[dict] = Field(default_factory=list)
+
+
+class ReceiptDocumentUnderstandingRequest(BaseModel):
+    image_base64: str = ""
+    image_url: str = ""
+    raw_text: str = ""
+    lines: list[str] = Field(default_factory=list)
+    ocr_blocks: list[dict] = Field(default_factory=list)
+    parser_json: dict = Field(default_factory=dict)
+    ocr_engine: str | None = None
+    ocr_variants: list[dict] = Field(default_factory=list)
+    run_llama: bool = True

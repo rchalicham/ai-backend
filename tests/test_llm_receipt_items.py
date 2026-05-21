@@ -1,8 +1,12 @@
 import json
 import os
 import importlib.util
+import sys
+from types import SimpleNamespace
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 SPEC = importlib.util.spec_from_file_location("actual_llm_service", os.path.join(ROOT, "services", "llm_service.py"))
 actual_llm_service = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(actual_llm_service)
@@ -52,6 +56,39 @@ Sold Item Count = 5
     assert receipt["subtotal"] == "52.95"
     assert [item["amount"] for item in receipt["items"]] == ["9.99", "16.99", "19.99", "2.49", "3.49"]
     assert [item["name"] for item in receipt["items"]] == ["PET", "GARDEN", "GARDEN", "Q LINE", "GOURMET FOOD"]
+
+
+def test_finalize_receipt_prefers_reconciled_intelligence_items_over_llm_duplicates():
+    service = LLMService()
+    intelligence = SimpleNamespace(
+        merchant="CVS",
+        items=[{"name": "SRTGA SPRK SPRNG Wi 282", "qty": "1", "amount": "2.89", "weight": 0.93}],
+        facts={"total": "2.89", "subtotal": "", "tax": "0", "tip": "0"},
+        lines=[],
+        semantic_blocks=[],
+        tables=[],
+        graph={},
+        layout_json={},
+    )
+    structured = {
+        "company": "CVS",
+        "subtotal": "0",
+        "tax": "0",
+        "tip": "0",
+        "total": "2.89",
+        "items": [
+            {"name": "SRTGA SPRK SPRNG Wi 282", "qty": "1", "amount": "2.89"},
+            {"name": "SRTGA SPRK SPRNG W 282", "qty": "1", "amount": "2.89"},
+            {"name": "SRTGA SPRK SPRNG WW 282", "qty": "1", "amount": "2.89"},
+        ],
+    }
+
+    receipt = service._finalize_receipt_intelligence(structured, intelligence)
+
+    assert [(item["name"], item["qty"], item["amount"]) for item in receipt["items"]] == [
+        ("SRTGA SPRK SPRNG Wi 282", "1", "2.89")
+    ]
+    assert receipt["receiptIntelligence"]["validation"]["itemSum"] == "2.89"
 
 
 def test_receipt_company_uses_merchant_footer_clues_over_plaza_line():
@@ -162,6 +199,56 @@ TOTAL: 103.08
     assert receipt["items"][0]["name"] == "5-TIER BLACK WIRE SHELVING"
 
 
+def test_lowes_tax_prefers_inferred_tax_when_llm_copies_total():
+    service = LLMService()
+    raw_text = """
+LOWE'S HOME CENTERS, LLC
+21av74 S-TIER BLACK WIRE SHELUIN 94,96
+SUBTOTAL: 94.98
+TCTAL fAXK: 8.10
+INVOICE TOTAL: 103.08
+AMEX: 103.08
+"""
+    llm_content = json.dumps({
+        "company": "LOWE'S HOME CENTERS, LLC",
+        "subtotal": "94.98",
+        "tax": "103.08",
+        "total": "103.08",
+        "items": [
+            {"name": "21av74 S-TIER BLACK WIRE SHELUIN", "amount": "94.96"},
+        ],
+    })
+
+    receipt = service._normalize_receipt_response(llm_content, {}, raw_text)
+
+    assert receipt["tax"] == "8.10"
+    assert receipt["total"] == "103.08"
+
+
+def test_lowes_company_corrects_pent_cop_ocr_variant():
+    service = LLMService()
+    raw_text = """
+PENT COP
+HOME CENFERS, LLC
+21av74 S-TIER BLACK WIRE SHELUIN 94,96
+SUBTOTAL: 94.98
+TOTAL: 103.08
+"""
+    llm_content = json.dumps({
+        "company": "PENT COP",
+        "subtotal": "94.98",
+        "total": "103.08",
+        "items": [
+            {"name": "21av74 S-TIER BLACK WIRE SHELUIN", "amount": "94.96"},
+        ],
+    })
+
+    receipt = service._normalize_receipt_response(llm_content, {}, raw_text)
+
+    assert receipt["company"] == "LOWE'S HOME CENTERS, LLC"
+    assert receipt["storeName"] == "LOWE'S HOME CENTERS, LLC"
+
+
 def test_receipt_items_ignore_duplicate_later_ocr_passes_after_first_subtotal():
     service = LLMService()
     raw_text = """
@@ -229,3 +316,40 @@ STGRE: 195>D TERMINAL: 29 91/05/23 17-35-22
     receipt = service._normalize_receipt_response(llm_content, {}, raw_text)
 
     assert receipt["purchaseDate"].startswith("11/05/2023")
+
+
+def test_llm_receipt_postprocess_rejects_cvs_mutated_totals_and_bad_subtotal():
+    service = LLMService()
+    raw_text = """
+1 Srtga SPRK Sprng Wi 282 2,89F
+A179 9484 0417 347 13, NO PETPEIEE (ER TAED IE 28000
+07/13/2026
+SRTGA SPRK SPRNG Wi 282
+1
+$2.89
+GATT
+1
+$347.13
+HARGE
+1
+$2.89
+"""
+    llm_content = json.dumps({
+        "company": "",
+        "subtotal": "347",
+        "tax": "0",
+        "total": "2.89",
+        "items": [
+            {"name": "SRTGA SPRK SPRNG Wi 282", "qty": "1", "amount": "2.89"},
+            {"name": "GATT", "qty": "1", "amount": "347.13"},
+            {"name": "HARGE", "qty": "1", "amount": "2.89"},
+        ],
+    })
+
+    receipt = service._normalize_receipt_response(llm_content, {}, raw_text)
+
+    assert receipt["subtotal"] == ""
+    assert receipt["total"] == "2.89"
+    assert [(item["name"], item["qty"], item["amount"]) for item in receipt["items"]] == [
+        ("SRTGA SPRK SPRNG Wi", "1", "2.89")
+    ]

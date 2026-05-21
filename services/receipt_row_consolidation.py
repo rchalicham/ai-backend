@@ -1,0 +1,697 @@
+from __future__ import annotations
+
+import itertools
+import logging
+import re
+from dataclasses import dataclass, field
+from typing import Any
+
+try:
+    from rapidfuzz import fuzz
+except Exception:  # pragma: no cover - exercised only when dependency is unavailable.
+    fuzz = None
+
+from services.receipt_intelligence import MerchantNormalizer
+from services.receipt_entity_extraction import ReceiptEntityExtractionEngine
+from services.receipt_section_engine import ReceiptSectionExtractionEngine
+
+
+logger = logging.getLogger(__name__)
+
+RECEIPT_TOTAL_TERMS = (
+    "SUBTOTAL", "SUB TOTAL", "TOTAL", "TAX", "TIP", "CHANGE", "BALANCE", "AMOUNT",
+    "PAYMENT", "CASH", "CREDIT", "DEBIT", "VISA", "MASTERCARD", "AMEX", "DISCOVER",
+    "AUTH", "APPROVED", "TERMINAL", "TRANS", "TRANSACTION", "CARD", "AID",
+)
+
+RECEIPT_FOOTER_TERMS = (
+    "THANK", "SURVEY", "FEEDBACK", "RETURN POLICY", "COME AGAIN", "SAVINGS",
+    "ITEM COUNT", "SOLD ITEM", "STORE", "PHARMACY", "ROAD", "STREET", "PLYMOUTH",
+    "BARCODE", "COUPON", "REWARD",
+)
+
+PRODUCT_STOPWORDS = {
+    "REG", "TRN", "CSHR", "STR", "ROAD", "NORTH", "STORE", "PHARMACY", "EA",
+}
+
+RECEIPT_LEVEL_CANONICAL_TERMS = (
+    "TOTAL", "SUBTOTAL", "TAX", "TIP", "CHARGE", "PAYMENT", "CHANGE", "BALANCE",
+    "VISA", "MASTERCARD", "AMEX", "DISCOVER", "AUTH", "CARD", "CASH",
+)
+RECEIPT_LEVEL_OCR_MUTATIONS = {
+    "GATT", "HARGE", "T0TAL", "TOTAI", "TQTAL", "SUBT0TAL", "CHARGF", "CHAR6E",
+}
+
+
+@dataclass
+class ReceiptSection:
+    kind: str
+    start: int
+    end: int
+    confidence: float = 0.0
+    bbox: dict[str, float] | None = None
+
+
+@dataclass
+class CandidateRow:
+    source: str
+    name: str
+    amount: str
+    qty: str = "1"
+    confidence: float = 0.5
+    bbox: dict[str, float] | None = None
+    raw: dict[str, Any] = field(default_factory=dict)
+    section: str = "unknown"
+    reasons: list[str] = field(default_factory=list)
+
+    @property
+    def amount_value(self) -> float:
+        return _numeric_amount(self.amount)
+
+
+def _compact(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _amount(value: Any) -> str:
+    text = str(value or "").replace("$", "").replace(",", ".")
+    match = re.search(r"-?\d{1,6}(?:\.\d{2})(?=\b|[A-Z])", text, flags=re.IGNORECASE)
+    if match:
+        return match.group(0)
+    match = re.search(r"-?\d{1,6}\b", text)
+    return match.group(0) if match else ""
+
+
+def _numeric_amount(value: Any) -> float:
+    parsed = _amount(value)
+    try:
+        return float(parsed) if parsed else 0.0
+    except ValueError:
+        return 0.0
+
+
+def _canonical_name(value: str) -> str:
+    text = _compact(value).upper()
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"[\[\]{}()\"']", " ", text)
+    text = re.sub(r"[^A-Z0-9&./ -]+", " ", text)
+    text = re.sub(r"\b\d{5,}\b", " ", text)
+    tokens = []
+    for token in text.split():
+        normalized = re.sub(r"[^A-Z0-9]", "", token)
+        if not normalized:
+            continue
+        if normalized in PRODUCT_STOPWORDS:
+            continue
+        if normalized.isdigit():
+            continue
+        tokens.append(normalized)
+    return " ".join(tokens)
+
+
+def _similarity(left: str, right: str) -> float:
+    left_key = _canonical_name(left)
+    right_key = _canonical_name(right)
+    if not left_key or not right_key:
+        return 0.0
+    if fuzz is not None:
+        return float(fuzz.token_set_ratio(left_key, right_key))
+    left_tokens = set(left_key.split())
+    right_tokens = set(right_key.split())
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return 100.0 * len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+
+
+class ReceiptSectionSegmenter:
+    def segment(self, lines: list[str], boxes: list[dict[str, Any]] | None = None) -> list[ReceiptSection]:
+        if boxes:
+            return self._from_boxes(boxes)
+        if not lines:
+            return []
+        sections: list[ReceiptSection] = []
+        current_kind = self._classify_line(lines[0], 0)
+        start = 0
+        for index, line in enumerate(lines[1:], start=1):
+            kind = self._classify_line(line, index)
+            if kind != current_kind:
+                sections.append(ReceiptSection(current_kind, start, index - 1, confidence=0.7))
+                start = index
+                current_kind = kind
+        sections.append(ReceiptSection(current_kind, start, len(lines) - 1, confidence=0.7))
+        return self._coalesce(sections)
+
+    def locate_text(self, text: str, lines: list[str], sections: list[ReceiptSection]) -> str:
+        key = _canonical_name(text)
+        if not key:
+            return "unknown"
+        for index, line in enumerate(lines):
+            if key and key in _canonical_name(line):
+                for section in sections:
+                    if section.start <= index <= section.end:
+                        return section.kind
+        return "unknown"
+
+    def _from_boxes(self, boxes: list[dict[str, Any]]) -> list[ReceiptSection]:
+        ordered = sorted(
+            [box for box in boxes if isinstance(box, dict) and _compact(box.get("text") or box.get("value"))],
+            key=lambda box: float(box.get("y", (box.get("bbox") or {}).get("y", 0)) or 0),
+        )
+        lines = [_compact(box.get("text") or box.get("value")) for box in ordered]
+        return self.segment(lines)
+
+    def _classify_line(self, line: str, index: int) -> str:
+        upper = _compact(line).upper()
+        if index <= 4 and re.search(r"[A-Z]{3,}", upper) and not re.search(r"\d{1,6}(?:[.,]\d{2})", upper):
+            return "header"
+        if any(term in upper for term in RECEIPT_TOTAL_TERMS):
+            return "totals"
+        if any(term in upper for term in RECEIPT_FOOTER_TERMS):
+            return "footer"
+        if re.search(r"[A-Z]{3,}", upper) and re.search(r"\d{1,6}(?:[.,]\d{2})", upper):
+            return "items"
+        return "unknown"
+
+    def _coalesce(self, sections: list[ReceiptSection]) -> list[ReceiptSection]:
+        if not sections:
+            return []
+        output = [sections[0]]
+        for section in sections[1:]:
+            previous = output[-1]
+            if previous.kind == section.kind:
+                previous.end = section.end
+                previous.confidence = max(previous.confidence, section.confidence)
+            else:
+                output.append(section)
+        return output
+
+
+class ReceiptCandidateExtractor:
+    def extract(
+        self,
+        donut: dict[str, Any],
+        lines: list[str],
+        sections: list[ReceiptSection],
+        segmenter: ReceiptSectionSegmenter,
+        section_items: list[dict[str, Any]] | None = None,
+    ) -> list[CandidateRow]:
+        candidates: list[CandidateRow] = []
+        for index, item in enumerate(donut.get("items") or []):
+            if not isinstance(item, dict):
+                continue
+            row = CandidateRow(
+                source="donut.items",
+                name=_compact(item.get("name") or item.get("description") or item.get("item")),
+                amount=_amount(item.get("amount") or item.get("price") or item.get("total")),
+                qty=self._qty(item.get("qty") or item.get("count") or item.get("quantity")),
+                confidence=float(item.get("confidence") or donut.get("confidence") or 0.55),
+                bbox=item.get("bbox") if isinstance(item.get("bbox"), dict) else None,
+                raw=item,
+            )
+            row.section = segmenter.locate_text(row.name, lines, sections)
+            candidates.append(row)
+
+        raw = donut.get("raw") if isinstance(donut.get("raw"), dict) else {}
+        self._extract_menu(raw, candidates, lines, sections, segmenter)
+        self._extract_section_items(section_items or [], candidates)
+        for index, line in enumerate(lines):
+            match = re.search(r"(?P<name>.+?)\s+(?P<amount>-?\d{1,6}(?:[.,]\d{2}))\s*[A-Z]?$", line)
+            if not match:
+                continue
+            section = next((section.kind for section in sections if section.start <= index <= section.end), "unknown")
+            candidates.append(CandidateRow(
+                source="ocr.line",
+                name=_compact(match.group("name")),
+                amount=_amount(match.group("amount")),
+                confidence=0.64 if section == "items" else 0.42,
+                raw={"line": line, "lineIndex": index},
+                section=section,
+            ))
+        return candidates
+
+    def _extract_section_items(self, items: list[dict[str, Any]], candidates: list[CandidateRow]) -> None:
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            candidates.append(CandidateRow(
+                source="section.items",
+                name=_compact(item.get("name") or item.get("description") or item.get("item")),
+                amount=_amount(item.get("amount") or item.get("price") or item.get("total")),
+                qty=self._qty(item.get("qty") or item.get("count") or item.get("quantity")),
+                confidence=float(item.get("confidence") or 0.68),
+                raw=item,
+                section="items",
+            ))
+
+    def _extract_menu(
+        self,
+        raw: dict[str, Any],
+        candidates: list[CandidateRow],
+        lines: list[str],
+        sections: list[ReceiptSection],
+        segmenter: ReceiptSectionSegmenter,
+    ) -> None:
+        menu = raw.get("menu") or raw.get("items") or []
+        if isinstance(menu, dict):
+            menu = [menu]
+        if not isinstance(menu, list):
+            return
+        for item in menu:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("nm") or item.get("name") or item.get("description") or item.get("item")
+            amount = item.get("price") or item.get("amount") or item.get("totalprice") or item.get("subtotal")
+            if isinstance(name, list):
+                name = " ".join(str(part) for part in name)
+            if isinstance(amount, dict):
+                amount = amount.get("text") or amount.get("value") or amount.get("price")
+            row = CandidateRow(
+                source="donut.raw.menu",
+                name=_compact(name),
+                amount=_amount(amount),
+                qty=self._qty(item.get("cnt") or item.get("qty") or item.get("quantity")),
+                confidence=0.58,
+                bbox=item.get("bbox") if isinstance(item.get("bbox"), dict) else None,
+                raw=item,
+            )
+            row.section = segmenter.locate_text(row.name, lines, sections)
+            candidates.append(row)
+
+    def _qty(self, value: Any) -> str:
+        match = re.search(r"\d+(?:[.,]\d+)?", str(value or ""))
+        return match.group(0).replace(",", ".") if match else "1"
+
+
+class ReceiptRowValidator:
+    def validate(self, row: CandidateRow, facts: dict[str, str]) -> tuple[bool, list[str], float]:
+        reasons: list[str] = []
+        name = _compact(row.name)
+        canonical = _canonical_name(name)
+        upper = name.upper()
+        if row.confidence < 0.35:
+            reasons.append("low_source_confidence")
+        if not row.amount or row.amount_value <= 0:
+            reasons.append("missing_or_zero_amount")
+        if len(canonical) < 3 or not re.search(r"[A-Z]{3,}", canonical):
+            reasons.append("invalid_product_name")
+        if any(term in upper for term in RECEIPT_TOTAL_TERMS):
+            reasons.append("receipt_level_term")
+        if self._near_receipt_level_term(canonical):
+            reasons.append("ocr_mutation_of_receipt_level_term")
+        if any(term in upper for term in RECEIPT_FOOTER_TERMS) and len(canonical.split()) > 4:
+            reasons.append("footer_or_address_text")
+        if self._survey_or_barcode_row(upper):
+            reasons.append("survey_or_barcode_numeric_row")
+        if any(token in upper for token in ("REG#", "TRN#", "CSHR", "STR#", "PHARMACY:", "STORE:")):
+            reasons.append("terminal_or_store_metadata")
+        if re.search(r"\[|\]|<S_", name, flags=re.IGNORECASE):
+            reasons.append("serialized_or_tagged_text")
+        alpha = len(re.findall(r"[A-Za-z]", name))
+        non_space = len(re.sub(r"\s+", "", name))
+        if non_space and alpha / non_space < 0.45:
+            reasons.append("low_alpha_ratio")
+        if row.section in {"totals", "payment", "footer"}:
+            reasons.append(f"excluded_section_{row.section}")
+        receipt_amounts = {_amount(value) for value in facts.values() if _amount(value)}
+        if row.amount in receipt_amounts and len(canonical.split()) <= 2:
+            reasons.append("weak_name_matches_receipt_total")
+        if len(canonical.split()) == 1 and len(canonical) <= 5:
+            reasons.append("short_single_token_product_name")
+        score = self.score(row, reasons)
+        hard_rejects = {
+            "receipt_level_term",
+            "ocr_mutation_of_receipt_level_term",
+            "footer_or_address_text",
+            "serialized_or_tagged_text",
+            "terminal_or_store_metadata",
+            "invalid_product_name",
+            "missing_or_zero_amount",
+            "survey_or_barcode_numeric_row",
+        }
+        if "weak_name_matches_receipt_total" in reasons and "short_single_token_product_name" in reasons:
+            hard_rejects.add("weak_name_matches_receipt_total")
+        return (
+            score >= 0.52
+            and not any(reason.startswith("excluded_section") for reason in reasons)
+            and not any(reason in hard_rejects for reason in reasons)
+        ), reasons, score
+
+    def score(self, row: CandidateRow, reasons: list[str]) -> float:
+        canonical = _canonical_name(row.name)
+        token_count = len(canonical.split())
+        score = min(0.35, row.confidence * 0.28)
+        score += 0.22 if row.amount_value > 0 else 0
+        score += min(0.2, token_count * 0.06)
+        score += 0.12 if row.section == "items" else 0
+        score += 0.08 if any(len(token) >= 4 for token in canonical.split()) else 0
+        score -= 0.16 * len(set(reasons))
+        return round(max(0.0, min(1.0, score)), 3)
+
+    def _near_receipt_level_term(self, canonical: str) -> bool:
+        first = canonical.split()[0] if canonical.split() else ""
+        if len(first) < 4:
+            return False
+        if first in RECEIPT_LEVEL_OCR_MUTATIONS:
+            return True
+        if fuzz is not None:
+            return any(fuzz.ratio(first, term) >= 72 for term in RECEIPT_LEVEL_CANONICAL_TERMS)
+        return first in RECEIPT_LEVEL_CANONICAL_TERMS or any(self._one_edit_apart(first, term) for term in RECEIPT_LEVEL_CANONICAL_TERMS)
+
+    def _one_edit_apart(self, left: str, right: str) -> bool:
+        if abs(len(left) - len(right)) > 1:
+            return False
+        if len(left) == len(right):
+            return sum(1 for a, b in zip(left, right) if a != b) <= 1
+        short, long = (left, right) if len(left) < len(right) else (right, left)
+        for index in range(len(long)):
+            if long[:index] + long[index + 1:] == short:
+                return True
+        return False
+
+    def _survey_or_barcode_row(self, upper: str) -> bool:
+        if any(token in upper for token in ("SURVEY", "BARCODE", "COUPON", "REWARD", "RECEIPT ID")):
+            return True
+        digits = re.sub(r"\D", "", upper)
+        return len(digits) >= 8 and not re.search(r"\d{1,6}[.,]\d{2}", upper)
+
+
+class ReceiptDuplicateClusterer:
+    def cluster(self, rows: list[CandidateRow]) -> list[list[CandidateRow]]:
+        clusters: list[list[CandidateRow]] = []
+        for row in rows:
+            target = None
+            for cluster in clusters:
+                representative = cluster[0]
+                same_price = abs(representative.amount_value - row.amount_value) <= 0.01
+                similar = _similarity(representative.name, row.name) >= 86
+                if same_price and similar:
+                    target = cluster
+                    break
+            if target is None:
+                clusters.append([row])
+            else:
+                target.append(row)
+        return clusters
+
+    def consolidate(self, cluster: list[CandidateRow], validator: ReceiptRowValidator, facts: dict[str, str]) -> dict[str, Any]:
+        best = max(cluster, key=lambda row: (validator.score(row, row.reasons), len(_canonical_name(row.name)), row.confidence))
+        qty = best.qty or "1"
+        confidence = min(0.98, validator.score(best, best.reasons) + min(0.18, 0.04 * (len(cluster) - 1)))
+        return {
+            "name": self._clean_name(best.name),
+            "qty": qty,
+            "count": qty,
+            "amount": f"{best.amount_value:.2f}",
+            "price": f"{best.amount_value:.2f}",
+            "confidence": round(confidence, 3),
+            "sourceRows": len(cluster),
+            "sources": sorted({row.source for row in cluster}),
+        }
+
+    def _clean_name(self, value: str) -> str:
+        text = _compact(value)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"[\[\]{}\"']", " ", text)
+        text = re.sub(r"\b\d{5,}\b", " ", text)
+        text = re.sub(r"\s+", " ", text).strip(" -_:;,")
+        return text
+
+
+class ReceiptSubtotalReconciler:
+    def reconcile(self, items: list[dict[str, Any]], facts: dict[str, str]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        subtotal = _numeric_amount(facts.get("subtotal"))
+        total = _numeric_amount(facts.get("total"))
+        target = subtotal or total
+        item_sum = sum(_numeric_amount(item.get("amount")) for item in items)
+        diagnostics = {
+            "itemSum": f"{item_sum:.2f}" if item_sum else "0",
+            "target": f"{target:.2f}" if target else "",
+            "matched": False,
+            "warnings": [],
+        }
+        if not items or not target:
+            return items, diagnostics
+        if abs(item_sum - target) <= max(0.25, target * 0.03):
+            diagnostics["matched"] = True
+            return items, diagnostics
+        selected = self._best_subset(items, target)
+        if selected:
+            selected_sum = sum(_numeric_amount(item.get("amount")) for item in selected)
+            if abs(selected_sum - target) < abs(item_sum - target):
+                diagnostics["itemSum"] = f"{selected_sum:.2f}"
+                diagnostics["matched"] = abs(selected_sum - target) <= max(0.25, target * 0.03)
+                diagnostics["warnings"].append("subtotal_subset_reconciled")
+                return selected, diagnostics
+        diagnostics["warnings"].append("item_sum_does_not_match_receipt_total")
+        return items, diagnostics
+
+    def _best_subset(self, items: list[dict[str, Any]], target: float) -> list[dict[str, Any]]:
+        if len(items) > 16:
+            return []
+        best_delta = target
+        best_subset: list[dict[str, Any]] = []
+        for size in range(1, len(items) + 1):
+            for subset in itertools.combinations(items, size):
+                total = sum(_numeric_amount(item.get("amount")) for item in subset)
+                delta = abs(total - target)
+                if delta < best_delta:
+                    best_delta = delta
+                    best_subset = list(subset)
+        return best_subset if best_subset and best_delta <= max(0.5, target * 0.08) else []
+
+
+class ReceiptRowConsolidationPipeline:
+    def __init__(self) -> None:
+        self.segmenter = ReceiptSectionSegmenter()
+        self.extractor = ReceiptCandidateExtractor()
+        self.validator = ReceiptRowValidator()
+        self.clusterer = ReceiptDuplicateClusterer()
+        self.reconciler = ReceiptSubtotalReconciler()
+        self.merchants = MerchantNormalizer()
+        self.section_engine = ReceiptSectionExtractionEngine()
+        self.entity_engine = ReceiptEntityExtractionEngine()
+
+    def normalize(
+        self,
+        donut: dict[str, Any],
+        raw_text: str = "",
+        lines: list[str] | None = None,
+        ocr_blocks: list[dict[str, Any]] | None = None,
+        parser_json: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        parser_json = parser_json or {}
+        source_lines = [line for line in (lines or []) if str(line).strip()]
+        if not source_lines and raw_text:
+            source_lines = [line for line in raw_text.splitlines() if line.strip()]
+        sections = self.segmenter.segment(source_lines, ocr_blocks)
+        facts = self._facts(donut, parser_json)
+        section_result = self.section_engine.extract(raw_text=raw_text, lines=source_lines, ocr_blocks=ocr_blocks)
+        self._merge_section_facts(facts, section_result)
+        entity_result = self.entity_engine.extract(raw_text=raw_text, lines=source_lines, ocr_blocks=ocr_blocks)
+        self._merge_entity_facts(facts, entity_result)
+        self._sanitize_receipt_facts(facts)
+        candidates = self.extractor.extract(
+            donut,
+            source_lines,
+            sections,
+            self.segmenter,
+            section_items=section_result.get("items") if isinstance(section_result.get("items"), list) else [],
+        )
+        boundary_lock = self._section_boundary_lock(section_result)
+        self._apply_boundary_lock(candidates, boundary_lock)
+        accepted: list[CandidateRow] = []
+        rejected: list[dict[str, Any]] = []
+        for row in candidates:
+            valid, reasons, score = self.validator.validate(row, facts)
+            row.reasons = reasons
+            row.confidence = min(1.0, max(row.confidence, score))
+            if valid:
+                accepted.append(row)
+            else:
+                rejected.append({
+                    "source": row.source,
+                    "name": row.name,
+                    "amount": row.amount,
+                    "section": row.section,
+                    "confidence": score,
+                    "reasons": reasons,
+                })
+        clusters = self.clusterer.cluster(accepted)
+        consolidated = [self.clusterer.consolidate(cluster, self.validator, facts) for cluster in clusters]
+        consolidated, reconciliation = self.reconciler.reconcile(consolidated, facts)
+        consolidated = [{**item, "id": index + 1} for index, item in enumerate(consolidated)]
+        merchant = self.merchants.normalize(
+            "\n".join(source_lines) or raw_text,
+            str(facts.get("merchant") or donut.get("merchant") or parser_json.get("company") or parser_json.get("storeName") or ""),
+        )
+        confidence = self._overall_confidence(consolidated, reconciliation, merchant, candidates, rejected)
+        retry_plan = self._retry_plan(consolidated, reconciliation, confidence)
+        normalized = {
+            **donut,
+            "merchant": merchant,
+            "address": facts.get("address", ""),
+            "storeAddress": facts.get("storeAddress", facts.get("address", "")),
+            "phone": facts.get("phone", ""),
+            "items": consolidated,
+            "subtotal": facts.get("subtotal", ""),
+            "tax": facts.get("tax", ""),
+            "tip": facts.get("tip", ""),
+            "charge": facts.get("charge", ""),
+            "total": facts.get("total", ""),
+            "paymentMethod": facts.get("paymentMethod", ""),
+            "cardType": facts.get("cardUsed", ""),
+            "lastFour": facts.get("cardLast4", ""),
+            "cardUsed": facts.get("cardUsed", ""),
+            "cardLast4": facts.get("cardLast4", ""),
+            "approvalCode": facts.get("approvalCode", ""),
+            "paymentCard": {
+                "brand": facts.get("cardUsed", ""),
+                "last4": facts.get("cardLast4", ""),
+                "approvalCode": facts.get("approvalCode", ""),
+            },
+            "confidence": confidence["overall"],
+            "sectionExtraction": section_result,
+            "receiptEntities": entity_result,
+            "rowConsolidation": {
+                "schemaVersion": "receipt-row-consolidation-v1",
+                "candidateCount": len(candidates),
+                "acceptedCandidateCount": len(accepted),
+                "rejectedCandidateCount": len(rejected),
+                "clusterCount": len(clusters),
+                "sections": [section.__dict__ for section in sections],
+                "boundaryLock": boundary_lock,
+                "reconciliation": reconciliation,
+                "confidence": confidence,
+                "retryPlan": retry_plan,
+                "rejectedRows": rejected[:80],
+                "rapidFuzzAvailable": fuzz is not None,
+                "llamaValidation": {
+                    "strategy": "receipt/document-understanding run_llama=true performs final semantic validation",
+                    "required": confidence["overall"] < 0.74 or bool(reconciliation.get("warnings")),
+                },
+            },
+        }
+        logger.info(
+            "Donut receipt rows consolidated candidates=%s accepted=%s items=%s confidence=%s warnings=%s",
+            len(candidates),
+            len(accepted),
+            len(consolidated),
+            confidence["overall"],
+            reconciliation.get("warnings", []),
+        )
+        return normalized
+
+    def _facts(self, donut: dict[str, Any], parser_json: dict[str, Any]) -> dict[str, str]:
+        donut_card = donut.get("paymentCard") if isinstance(donut.get("paymentCard"), dict) else {}
+        parser_card = parser_json.get("paymentCard") if isinstance(parser_json.get("paymentCard"), dict) else {}
+        return {
+            "subtotal": _amount(donut.get("subtotal") or parser_json.get("subtotal") or parser_json.get("subTotal")),
+            "tax": _amount(donut.get("tax") or parser_json.get("tax")),
+            "tip": _amount(donut.get("tip") or parser_json.get("tip")),
+            "charge": _amount(donut.get("charge") or parser_json.get("charge")),
+            "total": _amount(donut.get("total") or parser_json.get("total")),
+            "paymentMethod": _compact(donut.get("paymentMethod") or parser_json.get("paymentMethod")),
+            "cardUsed": _compact(donut.get("cardUsed") or donut_card.get("brand") or parser_json.get("cardUsed") or parser_card.get("brand")),
+            "cardLast4": _compact(donut.get("cardLast4") or donut_card.get("last4") or parser_json.get("cardLast4") or parser_card.get("last4")),
+            "approvalCode": _compact(donut.get("approvalCode") or parser_json.get("approvalCode")),
+            "merchant": _compact(donut.get("merchant") or parser_json.get("company") or parser_json.get("storeName")),
+            "address": _compact(donut.get("address") or donut.get("storeAddress") or parser_json.get("address") or parser_json.get("storeAddress")),
+            "storeAddress": _compact(donut.get("storeAddress") or donut.get("address") or parser_json.get("storeAddress") or parser_json.get("address")),
+            "phone": _compact(donut.get("phone") or parser_json.get("phone")),
+        }
+
+    def _merge_section_facts(self, facts: dict[str, str], section_result: dict[str, Any]) -> None:
+        totals = section_result.get("totals", {}) if isinstance(section_result, dict) else {}
+        total_fields = totals.get("fields", {}) if isinstance(totals, dict) else {}
+        for key in ("subtotal", "tax", "tip", "charge", "total"):
+            value = _amount(total_fields.get(key))
+            if value:
+                facts[key] = value
+        payment = section_result.get("payment", {}) if isinstance(section_result, dict) else {}
+        payment_fields = payment.get("fields", {}) if isinstance(payment, dict) else {}
+        for key in ("paymentMethod", "cardUsed", "cardLast4", "approvalCode"):
+            value = _compact(payment_fields.get(key))
+            if value:
+                facts[key] = value
+        payment_charge = _amount(payment_fields.get("charge"))
+        if payment_charge:
+            facts["charge"] = payment_charge
+
+    def _merge_entity_facts(self, facts: dict[str, str], entity_result: dict[str, Any]) -> None:
+        fields = entity_result.get("fields", {}) if isinstance(entity_result, dict) else {}
+        for key in ("merchant", "address", "storeAddress", "phone", "paymentMethod", "cardUsed", "cardLast4", "approvalCode"):
+            value = _compact(fields.get(key))
+            if value:
+                facts[key] = value
+        card_type = _compact(fields.get("cardType"))
+        if card_type:
+            facts["cardUsed"] = card_type
+        last_four = _compact(fields.get("lastFour"))
+        if last_four:
+            facts["cardLast4"] = last_four
+
+    def _sanitize_receipt_facts(self, facts: dict[str, str]) -> None:
+        subtotal = _numeric_amount(facts.get("subtotal"))
+        total = _numeric_amount(facts.get("total"))
+        tax = _numeric_amount(facts.get("tax"))
+        if subtotal and total:
+            if subtotal > max(total + tax + 0.5, total * 3):
+                logger.info("Discarding implausible receipt subtotal subtotal=%s total=%s tax=%s", facts.get("subtotal"), facts.get("total"), facts.get("tax"))
+                facts["subtotal"] = ""
+            elif "." not in str(facts.get("subtotal", "")) and abs(subtotal - total) > max(0.5, total * 0.08):
+                logger.info("Discarding no-cents subtotal that disagrees with total subtotal=%s total=%s", facts.get("subtotal"), facts.get("total"))
+                facts["subtotal"] = ""
+
+    def _section_boundary_lock(self, section_result: dict[str, Any]) -> dict[str, Any]:
+        debug = section_result.get("debug", {}) if isinstance(section_result, dict) else {}
+        lock = debug.get("itemBoundaryLock", {}) if isinstance(debug, dict) else {}
+        return lock if isinstance(lock, dict) else {}
+
+    def _apply_boundary_lock(self, candidates: list[CandidateRow], lock: dict[str, Any]) -> None:
+        first_index = lock.get("firstLockedIndex")
+        first_y = lock.get("firstLockedY")
+        for row in candidates:
+            line_index = row.raw.get("lineIndex") if isinstance(row.raw, dict) else None
+            if first_index is not None and isinstance(line_index, int) and line_index >= int(first_index):
+                row.section = "totals"
+                row.reasons.append("boundary_locked_after_totals")
+                continue
+            bbox = row.bbox if isinstance(row.bbox, dict) else {}
+            y = bbox.get("y", bbox.get("top"))
+            if first_y is not None and y is not None:
+                try:
+                    if float(y) >= float(first_y):
+                        row.section = "totals"
+                        row.reasons.append("boundary_locked_by_y_position")
+                except (TypeError, ValueError):
+                    pass
+
+    def _overall_confidence(
+        self,
+        items: list[dict[str, Any]],
+        reconciliation: dict[str, Any],
+        merchant: str,
+        candidates: list[CandidateRow],
+        rejected: list[dict[str, Any]],
+    ) -> dict[str, float]:
+        item_score = min(1.0, sum(float(item.get("confidence") or 0) for item in items) / max(len(items), 1)) if items else 0.0
+        validation_score = 1.0 if reconciliation.get("matched") else (0.7 if not reconciliation.get("target") else 0.46)
+        merchant_score = 1.0 if merchant else 0.0
+        rejection_penalty = min(0.24, len(rejected) / max(len(candidates), 1) * 0.24)
+        overall = (item_score * 0.48) + (validation_score * 0.3) + (merchant_score * 0.14) + 0.08 - rejection_penalty
+        return {
+            "overall": round(max(0.0, min(1.0, overall)), 3),
+            "items": round(item_score, 3),
+            "validation": round(validation_score, 3),
+            "merchant": round(merchant_score, 3),
+        }
+
+    def _retry_plan(self, items: list[dict[str, Any]], reconciliation: dict[str, Any], confidence: dict[str, float]) -> list[dict[str, str]]:
+        retries: list[dict[str, str]] = []
+        if not items:
+            retries.append({"stage": "donut", "strategy": "retry_with_preprocessed_receipt_image", "reason": "no_valid_items"})
+        if reconciliation.get("warnings"):
+            retries.append({"stage": "semantic", "strategy": "llama_receipt_row_validation", "reason": ",".join(reconciliation["warnings"])})
+        if confidence.get("overall", 0) < 0.7:
+            retries.append({"stage": "ocr", "strategy": "paddle_or_tesseract_cross_check", "reason": "low_consolidated_confidence"})
+        return retries[:5]

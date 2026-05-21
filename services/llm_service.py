@@ -10,6 +10,8 @@ import httpx
 from fastapi import HTTPException
 
 from services.attribute_catalog_service import AttributeCatalogService
+from services.receipt_entity_extraction import ReceiptEntityExtractionEngine
+from services.receipt_intelligence import ReceiptIntelligencePipeline
 
 
 class LLMService:
@@ -19,6 +21,8 @@ class LLMService:
             "http://host.docker.internal:8081/v1/chat/completions",
         )
         self.attribute_catalog_service = AttributeCatalogService()
+        self.receipt_intelligence = ReceiptIntelligencePipeline()
+        self.receipt_entities = ReceiptEntityExtractionEngine()
         self.request_timeout = float(os.getenv("LLM_TIMEOUT_SECONDS", "120"))
         self.client = httpx.AsyncClient(timeout=self.request_timeout)
 
@@ -26,10 +30,42 @@ class LLMService:
         self,
         raw_text: str,
         lines: list[str] | None = None,
+        ocr_blocks: list[dict[str, Any]] | None = None,
         parser_json: dict[str, Any] | None = None,
         ocr_engine: str | None = None,
         ocr_variants: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        intelligence = self.receipt_intelligence.analyze(
+            raw_text=raw_text,
+            lines=lines,
+            parser_json=parser_json,
+            ocr_variants=ocr_variants,
+            ocr_blocks=ocr_blocks,
+        )
+        reconstructed_lines = [line.text for line in intelligence.lines]
+        normalized_raw_text = "\n".join(reconstructed_lines) or raw_text
+        parser_hint = {
+            **(parser_json or {}),
+            "company": intelligence.merchant or (parser_json or {}).get("company", ""),
+            "storeName": intelligence.merchant or (parser_json or {}).get("storeName", ""),
+            **{
+                key: value
+                for key, value in (intelligence.entities.get("fields", {}) if isinstance(intelligence.entities, dict) else {}).items()
+                if value
+            },
+            "items": intelligence.items or (parser_json or {}).get("items", []),
+            **{key: value for key, value in intelligence.facts.items() if value},
+            "layout": intelligence.layout_json,
+            "semanticBlocks": [block.to_dict() for block in intelligence.semantic_blocks],
+            "tables": intelligence.tables,
+            "graph": intelligence.graph,
+            "receiptIntelligence": {
+                "confidence": intelligence.confidence,
+                "warnings": intelligence.warnings,
+                "retryPlan": intelligence.retry_plan,
+                "layoutQuality": intelligence.layout_json.get("quality", {}),
+            },
+        }
         schema = {
             "company": "merchant/store name",
             "storeName": "same value as company",
@@ -68,11 +104,13 @@ class LLMService:
                     "content": (
                         "You convert OCR receipt text into a strict JSON receipt schema. "
                         "Return ONLY valid JSON. No markdown, no commentary. "
-                        "Use OCR text as the source of truth. The parser JSON is only a hint. "
+                        "Use the structured receipt layout JSON as the primary reasoning input, then verify against OCR text. "
+                        "Flat OCR text is fallback evidence, not the preferred structure. The parser JSON is a hint. "
                         "Return purchased items plus receipt-level merchant/store name, store address, purchase date, card brand, card last digits, subtotal, tax, tip, and total. "
                         "Subtotal, tax, tip, total, purchase date, address, and company name are one-time receipt-level fields, never item fields. "
                         "Do not convert every OCR line into an item. Reason across adjacent OCR lines: item names are often on one line and prices on the next line; "
                         "product codes, E/N tax markers, discounts, and quantities may appear between them. Combine those lines into one item only when there is a real product name and a matching item amount. "
+                        "Prefer rows from the items table and semantic item blocks over duplicated footer/header OCR fragments. "
                         "Keep real purchased item rows only. Exclude store address, member number, payment card lines, approvals, item count summaries, "
                         "subtotal/tax/total/change lines, terminal metadata, savings summary, footer text, numeric-only rows, and product-code-only rows from items. "
                         "When OCR candidates disagree, prefer the candidate with clearer item names, prices, subtotal, tax, and total. "
@@ -85,9 +123,11 @@ class LLMService:
                     "content": (
                         f"Required JSON schema:\n{json.dumps(schema, ensure_ascii=True)}\n\n"
                         f"OCR engine: {ocr_engine or ''}\n"
+                        f"Structured receipt layout JSON:\n{json.dumps(intelligence.layout_json, ensure_ascii=True)}\n\n"
+                        f"Reconstructed receipt rows:\n{json.dumps(reconstructed_lines, ensure_ascii=True)}\n\n"
                         f"Line-by-line OCR text:\n{json.dumps(lines or [], ensure_ascii=True)}\n\n"
                         f"Alternate OCR candidates:\n{json.dumps(self._compact_ocr_variants(ocr_variants or []), ensure_ascii=True)}\n\n"
-                        f"Parser candidate JSON:\n{json.dumps(parser_json or {}, ensure_ascii=True)}\n\n"
+                        f"Parser candidate JSON:\n{json.dumps(parser_hint, ensure_ascii=True)}\n\n"
                         "Item reconstruction rules:\n"
                         "- One item must represent one purchased product, not one OCR row.\n"
                         "- A product-code row such as 331222 or 1462714 is not an item.\n"
@@ -95,7 +135,7 @@ class LLMService:
                         "- Payment, approval, subtotal, tax, total, change, savings, and footer rows are not items.\n"
                         "- For each item return name, count/qty, amount/price, and weight only.\n"
                         "- Put address, company, purchase date, tax, subtotal, total, tip, card brand, and last 4 digits only at receipt level.\n\n"
-                        f"Flat OCR text:\n{raw_text[:16000]}"
+                        f"Flat OCR text:\n{normalized_raw_text[:16000]}"
                     ),
                 },
             ],
@@ -106,22 +146,109 @@ class LLMService:
         try:
             response = await self.client.post(self.base_url, json=payload)
         except httpx.HTTPError:
-            return self._normalize_receipt_response("", parser_json or {}, raw_text)
+            return self._finalize_receipt_intelligence(
+                self._normalize_receipt_response("", parser_hint, normalized_raw_text),
+                intelligence,
+            )
 
         try:
             body = response.json()
         except ValueError:
-            return self._normalize_receipt_response("", parser_json or {}, raw_text)
+            return self._finalize_receipt_intelligence(
+                self._normalize_receipt_response("", parser_hint, normalized_raw_text),
+                intelligence,
+            )
 
         if response.status_code >= 400:
-            return self._normalize_receipt_response("", parser_json or {}, raw_text)
+            return self._finalize_receipt_intelligence(
+                self._normalize_receipt_response("", parser_hint, normalized_raw_text),
+                intelligence,
+            )
 
         try:
             content = body["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise HTTPException(status_code=502, detail="LLM response format was unexpected.") from exc
 
-        return self._normalize_receipt_response(content, parser_json or {}, raw_text)
+        return self._finalize_receipt_intelligence(
+            self._normalize_receipt_response(content, parser_hint, normalized_raw_text),
+            intelligence,
+        )
+
+    def _finalize_receipt_intelligence(self, structured: dict[str, Any], intelligence: Any) -> dict[str, Any]:
+        if intelligence.merchant and not structured.get("company"):
+            structured["company"] = intelligence.merchant
+            structured["storeName"] = intelligence.merchant
+        intelligence_items = self._normalize_intelligence_items(getattr(intelligence, "items", []))
+        if intelligence_items:
+            if not structured.get("items"):
+                structured["items"] = intelligence_items
+            else:
+                structured["items"] = self._prefer_reconciled_intelligence_items(structured, intelligence_items)
+        validation = self.receipt_intelligence.validator.validate(structured.get("items", []), intelligence.facts, structured)
+        confidence = self.receipt_intelligence.confidence.score(intelligence.lines, structured.get("items", []), validation, structured.get("company", ""))
+        retry_plan = self.receipt_intelligence.retry.plan(confidence, validation)
+        structured["receiptIntelligence"] = {
+            "version": "2026.05",
+            "lineCount": len(intelligence.lines),
+            "reconstructedLines": [line.text for line in intelligence.lines[:160]],
+            "merchantNormalized": structured.get("company", ""),
+            "layout": intelligence.layout_json,
+            "semanticBlocks": [block.to_dict() for block in intelligence.semantic_blocks],
+            "tables": intelligence.tables,
+            "graph": intelligence.graph,
+            "validation": validation,
+            "confidence": confidence,
+            "retryPlan": retry_plan,
+            "warnings": validation.get("warnings", []),
+        }
+        structured["confidence"] = confidence["overall"]
+        structured["aiRetryRecommended"] = bool(retry_plan)
+        return structured
+
+    def _normalize_intelligence_items(self, items: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+        normalized = []
+        for index, item in enumerate(items or []):
+            if not isinstance(item, dict):
+                continue
+            amount = self._format_amount(item.get("amount") or item.get("price"))
+            name = self._clean_receipt_item_name(item.get("name", ""))
+            if not self._is_valid_receipt_item(name, amount):
+                continue
+            normalized.append({
+                "id": index + 1,
+                "name": name,
+                "count": self._clean_receipt_item_qty(item.get("count") or item.get("qty") or "1"),
+                "qty": self._clean_receipt_item_qty(item.get("qty") or item.get("count") or "1"),
+                "amount": amount,
+                "price": amount,
+                "weight": self._safe_weight(item.get("weight", item.get("confidence", 1.0))),
+            })
+        return normalized
+
+    def _prefer_reconciled_intelligence_items(self, structured: dict[str, Any], intelligence_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        structured_items = structured.get("items") if isinstance(structured.get("items"), list) else []
+        if not structured_items:
+            return intelligence_items
+        target = self._receipt_reconciliation_target(structured)
+        if target <= 0:
+            return structured_items
+        structured_delta = abs(self._sum_receipt_items(structured_items) - target)
+        intelligence_delta = abs(self._sum_receipt_items(intelligence_items) - target)
+        if intelligence_delta + 0.01 < structured_delta:
+            return [{**item, "id": index + 1} for index, item in enumerate(intelligence_items)]
+        return structured_items
+
+    def _sum_receipt_items(self, items: list[dict[str, Any]]) -> float:
+        return sum(self._numeric_amount((item or {}).get("amount") or (item or {}).get("price")) for item in items if isinstance(item, dict))
+
+    def _receipt_reconciliation_target(self, structured: dict[str, Any]) -> float:
+        subtotal = self._numeric_amount(structured.get("subtotal") or structured.get("subTotal"))
+        total = self._numeric_amount(structured.get("total"))
+        tax = self._numeric_amount(structured.get("tax"))
+        if subtotal > 0 and (not total or subtotal <= max(total + tax + 0.5, total * 3)):
+            return subtotal
+        return total
 
     def _compact_ocr_variants(self, variants: list[dict[str, Any]]) -> list[dict[str, Any]]:
         compacted = []
@@ -178,11 +305,12 @@ class LLMService:
             return first
 
         inferred = self._infer_receipt_facts(raw_text, fallback or {})
+        entity_fields = self.receipt_entities.extract(raw_text=raw_text, lines=[line for line in raw_text.splitlines() if line.strip()]).get("fields", {})
         card = raw.get("paymentCard") if isinstance(raw.get("paymentCard"), dict) else {}
         inferred_company = inferred.get("company", "")
         company = self._choose_company_name(
             raw.get("storeName") or raw.get("company"),
-            fallback.get("company"),
+            fallback.get("company") or entity_fields.get("merchant"),
             inferred_company,
         )
         purchase_date = self._choose_purchase_date(
@@ -190,9 +318,11 @@ class LLMService:
             text_value(fallback.get("date"), ""),
             inferred.get("date", ""),
         )
-        card_brand = text_value(raw.get("cardUsed") or card.get("brand"), inferred.get("cardUsed", ""))
-        card_last4 = text_value(raw.get("cardLast4") or card.get("last4"), inferred.get("cardLast4", ""))
-        store_address = self._choose_store_address(raw.get("storeAddress"), inferred.get("storeAddress", ""))
+        card_brand = text_value(raw.get("cardUsed") or raw.get("cardType") or card.get("brand"), entity_fields.get("cardUsed") or inferred.get("cardUsed", ""))
+        card_last4 = text_value(raw.get("cardLast4") or raw.get("lastFour") or card.get("last4"), entity_fields.get("cardLast4") or inferred.get("cardLast4", ""))
+        approval_code = text_value(raw.get("approvalCode"), entity_fields.get("approvalCode", ""))
+        payment_method = text_value(raw.get("paymentMethod"), entity_fields.get("paymentMethod", ""))
+        store_address = self._choose_store_address(raw.get("storeAddress") or raw.get("address"), entity_fields.get("storeAddress") or inferred.get("storeAddress", ""))
 
         structured = {
             "company": company,
@@ -201,10 +331,15 @@ class LLMService:
             "date": purchase_date,
             "purchaseDate": purchase_date,
             "cardUsed": card_brand,
+            "cardType": card_brand,
             "cardLast4": card_last4,
+            "lastFour": card_last4,
+            "approvalCode": approval_code,
+            "paymentMethod": payment_method,
             "paymentCard": {
                 "brand": card_brand,
                 "last4": card_last4,
+                "approvalCode": approval_code,
             },
             "subtotal": receipt_amount(raw.get("subtotal"), raw.get("subTotal"), fallback.get("subtotal"), fallback.get("subTotal"), inferred.get("subtotal")),
             "tax": receipt_amount(raw.get("tax"), fallback.get("tax"), inferred.get("tax")),
@@ -212,6 +347,8 @@ class LLMService:
             "total": receipt_amount(raw.get("total"), fallback.get("total"), inferred.get("total")),
             "documentType": text_value(raw.get("documentType"), text_value(fallback.get("documentType"), "receipt")),
         }
+        self._reconcile_receipt_amounts(structured, inferred)
+        self._sanitize_receipt_amounts(structured)
         structured["subTotal"] = structured["subtotal"]
         try:
             structured["documentTypeConfidence"] = float(raw.get("documentTypeConfidence", fallback.get("documentTypeConfidence", 1.0)))
@@ -250,6 +387,24 @@ class LLMService:
         structured["aiStructured"] = True
         return structured
 
+    def _reconcile_receipt_amounts(self, structured: dict[str, Any], inferred: dict[str, str]) -> None:
+        subtotal = self._numeric_amount(structured.get("subtotal") or structured.get("subTotal"))
+        tax = self._numeric_amount(structured.get("tax"))
+        total = self._numeric_amount(structured.get("total"))
+        inferred_tax = self._numeric_amount(inferred.get("tax"))
+        if not subtotal or not total or not inferred_tax:
+            return
+
+        expected_tax = round(total - subtotal, 2)
+        if expected_tax <= 0:
+            return
+
+        current_tax_is_total = abs(tax - total) <= 0.01
+        current_tax_mismatches_total = tax and abs((subtotal + tax) - total) > max(0.35, total * 0.04)
+        inferred_tax_matches_total = abs(inferred_tax - expected_tax) <= max(0.35, total * 0.04)
+        if inferred_tax_matches_total and (not tax or current_tax_is_total or current_tax_mismatches_total):
+            structured["tax"] = f"{inferred_tax:.2f}"
+
     def _is_valid_receipt_item(self, name: str, item_amount: str) -> bool:
         normalized = re.sub(r"\s+", " ", str(name or "")).strip()
         upper = normalized.upper()
@@ -258,6 +413,8 @@ class LLMService:
         if re.fullmatch(r"[/#]?\d{3,}", normalized):
             return False
         if upper in {"E", "N", "Y", "T", "F", "CHIP", "READ", "VISA", "MASTERCARD", "AMEX", "DISCOVER", "CREDIT", "DEBIT"}:
+            return False
+        if self._near_receipt_level_term(upper):
             return False
         blocked_terms = (
             "SUBTOTAL", "SUB TOTAL", "TOTAL", "TAX", "TIP", "AMOUNT", "CHANGE", "APPROVED", "PURCHASE",
@@ -268,6 +425,38 @@ class LLMService:
         if any(term in blocked_upper for term in blocked_terms):
             return False
         return bool(re.search(r"[A-Za-z]", normalized)) and bool(re.search(r"[A-Za-z]{3,}", normalized))
+
+    def _near_receipt_level_term(self, upper: str) -> bool:
+        token = re.sub(r"[^A-Z]", "", upper.split()[0] if upper.split() else "")
+        if len(token) < 4:
+            return False
+        if token in {"GATT", "HARGE", "T0TAL", "TOTAI", "TQTAL", "SUBT0TAL", "CHARGF", "CHAR6E"}:
+            return True
+        targets = ("TOTAL", "SUBTOTAL", "CHARGE", "PAYMENT", "CHANGE", "VISA", "CARD", "AUTH", "CASH")
+        return any(self._one_edit_apart(token, target) for target in targets)
+
+    def _one_edit_apart(self, left: str, right: str) -> bool:
+        if abs(len(left) - len(right)) > 1:
+            return False
+        if len(left) == len(right):
+            return sum(1 for a, b in zip(left, right) if a != b) <= 1
+        short, long = (left, right) if len(left) < len(right) else (right, left)
+        for index in range(len(long)):
+            if long[:index] + long[index + 1:] == short:
+                return True
+        return False
+
+    def _sanitize_receipt_amounts(self, structured: dict[str, Any]) -> None:
+        subtotal = self._numeric_amount(structured.get("subtotal") or structured.get("subTotal"))
+        total = self._numeric_amount(structured.get("total"))
+        tax = self._numeric_amount(structured.get("tax"))
+        if subtotal and total:
+            if subtotal > max(total + tax + 0.5, total * 3):
+                structured["subtotal"] = ""
+                structured["subTotal"] = ""
+            elif "." not in str(structured.get("subtotal", "")) and abs(subtotal - total) > max(0.5, total * 0.08):
+                structured["subtotal"] = ""
+                structured["subTotal"] = ""
 
     def _clean_receipt_item_name(self, name: str) -> str:
         cleaned = re.sub(r"\s+", " ", str(name or "")).strip(" -_:;")
@@ -755,6 +944,9 @@ class LLMService:
 
     def _infer_company_name(self, raw_text: str, fallback: str) -> str:
         upper = (raw_text or "").upper()
+        normalized = self.receipt_intelligence.merchants.normalize(raw_text, fallback)
+        if normalized and normalized != fallback:
+            return normalized
         merchant_clue = self._infer_merchant_from_receipt_clues(raw_text)
         if merchant_clue:
             return merchant_clue
@@ -766,6 +958,7 @@ class LLMService:
             or "HOME CRENSERS" in upper
             or "LNWE'S" in upper
             or "PNWE'S" in upper
+            or "PENT COP" in upper
         ):
             return "LOWE'S HOME CENTERS, LLC"
         return fallback
@@ -802,9 +995,13 @@ class LLMService:
             "HOMEGOODS": "HomeGoods",
             "LOWES": "LOWE'S HOME CENTERS, LLC",
             "LOWE'S": "LOWE'S HOME CENTERS, LLC",
+            "PENT COP": "LOWE'S HOME CENTERS, LLC",
             "TARGET": "Target",
             "WALMART": "Walmart",
             "COSTCO": "Costco",
+            "CVS": "CVS Pharmacy",
+            "CVS PHARMACY": "CVS Pharmacy",
+            "CVS/PHARMACY": "CVS Pharmacy",
             "MENARDS": "Menards",
             "HOME DEPOT": "Home Depot",
             "THE HOME DEPOT": "Home Depot",
@@ -837,8 +1034,11 @@ class LLMService:
             "HOMEGOOLS": "HomeGoods",
             "LOWES": "LOWE'S HOME CENTERS, LLC",
             "LOWE'S": "LOWE'S HOME CENTERS, LLC",
+            "PENTCOP": "LOWE'S HOME CENTERS, LLC",
             "THEHOMEDEPOT": "Home Depot",
             "HOMEDEPOT": "Home Depot",
+            "CVS": "CVS Pharmacy",
+            "CVSPHARMACY": "CVS Pharmacy",
             "TJMAXX": "TJ Maxx",
         }
         for alias, merchant in aliases.items():
