@@ -992,7 +992,6 @@ class LLMService:
 
         upper = (raw_text or "").upper()
         known_merchants = {
-            "HOMEGOODS": "HomeGoods",
             "LOWES": "LOWE'S HOME CENTERS, LLC",
             "LOWE'S": "LOWE'S HOME CENTERS, LLC",
             "PENT COP": "LOWE'S HOME CENTERS, LLC",
@@ -1029,9 +1028,6 @@ class LLMService:
 
         upper = cleaned.upper().replace(" ", "")
         aliases = {
-            "HOMEGOODS": "HomeGoods",
-            "HOMEGOOUS": "HomeGoods",
-            "HOMEGOOLS": "HomeGoods",
             "LOWES": "LOWE'S HOME CENTERS, LLC",
             "LOWE'S": "LOWE'S HOME CENTERS, LLC",
             "PENTCOP": "LOWE'S HOME CENTERS, LLC",

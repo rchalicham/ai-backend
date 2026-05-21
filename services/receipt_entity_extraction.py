@@ -295,7 +295,11 @@ class PaymentEntityParser:
         windows: list[tuple[EntityLine, list[EntityLine]]] = []
         for index, line in enumerate(lines):
             upper = line.text.upper()
-            if any(token in upper for token in (*CARD_BRANDS.keys(), "CREDIT", "DEBIT", "CARD", "AUTH", "APPROVAL")) or re.search(r"[*X]{4,}\s*\d{3,4}", upper):
+            if (
+                any(token in upper for token in (*CARD_BRANDS.keys(), "CREDIT", "DEBIT", "CARD", "AUTH", "APPROVAL"))
+                or re.search(r"\bLAST\s*(?:FOUR|4)\b|\bCARD\s*LAST\b|\bENDING\s+IN\b", upper)
+                or re.search(r"[*X]{4,}\s*\d{3,4}", upper)
+            ):
                 windows.append((line, lines[max(0, index - 2): min(len(lines), index + 5)]))
         return windows
 
@@ -311,6 +315,7 @@ class PaymentEntityParser:
     def _last_four(self, windows: list[tuple[EntityLine, list[EntityLine]]]) -> EntityCandidate | None:
         patterns = [
             ("masked_pan", r"(?:[*X]{4,}|ENDING\s+IN|CARD\s*#?)\D{0,8}(\d{4})\b"),
+            ("last_four_label", r"\bLAST\s*(?:FOUR|4)\D{0,12}(\d{4})\b"),
             ("card_brand", r"\b(?:VISA|MASTERCARD|MASTER CARD|AMEX|DISCOVER)\D{0,20}(\d{4})\b"),
             ("generic_payment_line", r"\b(\d{4})\b"),
         ]
@@ -325,6 +330,14 @@ class PaymentEntityParser:
                     match = re.search(pattern, line.text, flags=re.IGNORECASE)
                     if match and self._near_payment_context(window, line):
                         return EntityCandidate(match.group(1), 0.93, "payment.last4_context_window", [line.index], {"line": line.text, "anchor": anchor.text})
+            label = next((line for line in window if re.search(r"\bLAST\s*(?:FOUR|4)\b|\bCARD\s*LAST\b|\bENDING\s+IN\b", line.text, flags=re.IGNORECASE)), None)
+            if label and self._near_payment_context(window, label):
+                for line in window:
+                    if self._looks_like_approval_line(line.text.upper()) or re.search(r"\bNOT\s+SET\b", line.text, flags=re.IGNORECASE):
+                        continue
+                    match = re.search(r"\b(\d{4})\b", line.text)
+                    if match:
+                        return EntityCandidate(match.group(1), 0.91, "payment.last4_label_window", [line.index], {"line": line.text, "anchor": anchor.text, "label": label.text})
         return None
 
     def _approval(self, windows: list[tuple[EntityLine, list[EntityLine]]]) -> EntityCandidate | None:
@@ -359,10 +372,18 @@ class PaymentEntityParser:
 
     def _near_payment_context(self, window: list[EntityLine], line: EntityLine) -> bool:
         text = " ".join(candidate.text.upper() for candidate in window)
-        return bool(any(token in text for token in (*CARD_BRANDS.keys(), "CREDIT", "DEBIT", "CARD")) or re.search(r"[*X]{4,}", line.text))
+        return bool(
+            any(token in text for token in (*CARD_BRANDS.keys(), "CREDIT", "DEBIT", "CARD"))
+            or re.search(r"\bLAST\s*(?:FOUR|4)\b|\bCARD\s*LAST\b|\bENDING\s+IN\b", text)
+            or re.search(r"[*X]{4,}", line.text)
+        )
 
     def _line_has_payment_context(self, upper: str) -> bool:
-        return bool(any(token in upper for token in (*CARD_BRANDS.keys(), "CREDIT", "DEBIT", "CARD", "ACCT", "ACCOUNT")) or re.search(r"[*X]{4,}", upper))
+        return bool(
+            any(token in upper for token in (*CARD_BRANDS.keys(), "CREDIT", "DEBIT", "CARD", "ACCT", "ACCOUNT"))
+            or re.search(r"\bLAST\s*(?:FOUR|4)\b|\bCARD\s*LAST\b|\bENDING\s+IN\b", upper)
+            or re.search(r"[*X]{4,}", upper)
+        )
 
 
 class ReceiptEntityConfidenceEngine:

@@ -19,6 +19,7 @@ TOTAL_KEYWORDS = (
 PAYMENT_KEYWORDS = (
     "VISA", "MASTERCARD", "MASTER CARD", "AMEX", "AMERICAN EXPRESS", "DISCOVER",
     "CREDIT", "DEBIT", "CARD", "AUTH", "APPROVAL", "APPROVED", "AID", "ENTRY", "CHIP",
+    "LAST FOUR", "LAST 4", "CARD LAST", "ENDING IN",
 )
 FOOTER_KEYWORDS = (
     "THANK", "SURVEY", "FEEDBACK", "RETURN POLICY", "COME AGAIN", "VISIT", "WWW.",
@@ -246,10 +247,10 @@ class ReceiptRegionClassifier:
         reasons: list[str] = []
         amount_count = len(re.findall(r"\d{1,7}(?:[.,]\d{2})", text))
         right_aligned_amount = self._has_right_aligned_amount(line, lines)
-        if index <= 4 and re.search(r"[A-Z]{3,}", upper) and amount_count == 0:
-            return "header", ["top_text_no_amount"], 0.8
         if any(keyword in upper for keyword in PAYMENT_KEYWORDS):
             return "payment", ["payment_keyword"], 0.9
+        if index <= 4 and re.search(r"[A-Z]{3,}", upper) and amount_count == 0:
+            return "header", ["top_text_no_amount"], 0.8
         if any(keyword in upper for keyword in TOTAL_KEYWORDS):
             return "totals", ["total_keyword"], 0.9
         if any(keyword in upper for keyword in FOOTER_KEYWORDS):
@@ -274,12 +275,23 @@ class ReceiptRegionClassifier:
 
     def _promote_contextual_regions(self, regions: list[ReceiptRegion]) -> list[ReceiptRegion]:
         seen_items = False
+        previous: ReceiptRegion | None = None
         for region in regions:
             if region.kind == "items":
                 seen_items = True
             if seen_items and region.kind == "unknown" and any(keyword in region.text.upper() for keyword in PAYMENT_KEYWORDS):
                 region.kind = "payment"
                 region.reasons.append("after_items_payment_context")
+            if (
+                previous
+                and previous.kind == "payment"
+                and region.kind == "unknown"
+                and re.fullmatch(r"\D*\d{4}\D*", region.text.strip())
+                and re.search(r"\bLAST\s*(?:FOUR|4)\b|\bCARD\s*LAST\b|\bENDING\s+IN\b", previous.text, flags=re.IGNORECASE)
+            ):
+                region.kind = "payment"
+                region.reasons.append("last4_value_after_payment_label")
+            previous = region
         return regions
 
     def _lock_boundaries(self, regions: list[ReceiptRegion]) -> list[ReceiptRegion]:
@@ -376,10 +388,11 @@ class PaymentParser:
             "charge": "",
         }
         candidates: list[dict[str, Any]] = []
-        for line in payment_lines:
+        payment_text = " ".join(line.text for line in payment_lines)
+        for index, line in enumerate(payment_lines):
             upper = line.text.upper()
             brand = self._brand(upper)
-            last4 = self._last4(line.text)
+            last4 = self._last4(line.text) or self._last4_window(payment_lines, index)
             approval = self._approval(line.text)
             charge = self._charge(line.text) if any(token in upper for token in ("CHARGE", "AMOUNT", "VISA", "MASTERCARD", "AMEX", "DISCOVER")) else ""
             if brand:
@@ -399,6 +412,8 @@ class PaymentParser:
                 "charge": charge,
                 "confidence": round(min(1.0, 0.58 + line.confidence * 0.32), 3),
             })
+        if not fields["cardLast4"]:
+            fields["cardLast4"] = self._last4(payment_text)
         if not fields["paymentMethod"] and any("CASH" in line.text.upper() for line in payment_lines):
             fields["paymentMethod"] = "cash"
         return {
@@ -416,11 +431,24 @@ class PaymentParser:
     def _last4(self, text: str) -> str:
         patterns = [
             r"(?:X{2,}|\*{2,}|ENDING\s+IN|CARD\s*#?)\s*(\d{4})\b",
+            r"\bLAST\s*(?:FOUR|4)\D{0,12}(\d{4})\b",
             r"\b(?:VISA|MASTERCARD|MASTER CARD|AMEX|DISCOVER)\D{0,12}(\d{4})\b",
             r"\b(\d{4})\s*$",
         ]
         for pattern in patterns:
             match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                return match.group(1)
+        return ""
+
+    def _last4_window(self, lines: list[Any], index: int) -> str:
+        current = lines[index].text
+        if not re.search(r"\bLAST\s*(?:FOUR|4)\b|\bCARD\s*LAST\b|\bENDING\s+IN\b|\b(?:VISA|MASTERCARD|MASTER CARD|AMEX|DISCOVER)\b", current, flags=re.IGNORECASE):
+            return ""
+        for line in lines[index: min(len(lines), index + 4)]:
+            if re.search(r"\b(?:AUTH|APPROVAL|APPR|NOT\s+SET)\b", line.text, flags=re.IGNORECASE):
+                continue
+            match = re.search(r"\b(\d{4})\b", line.text)
             if match:
                 return match.group(1)
         return ""

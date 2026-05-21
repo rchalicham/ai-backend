@@ -97,9 +97,9 @@ def test_receipt_company_uses_merchant_footer_clues_over_plaza_line():
 ROCKFORD PLAZA
 4190 VINEWOOD LANE #134
 PLYMOUTH, MN 55442
-HomeGoods VALUES YOUR FEEDBACK!!!
-THANK YOU FOR SHOPPING AT HOMEGOODS
-Visit www.HOMEGOODSFEEDBACK.com
+Fresh Thyme VALUES YOUR FEEDBACK!!!
+THANK YOU FOR SHOPPING AT FRESH THYME
+Visit www.FRESHTHYMEFEEDBACK.com
 """
     llm_content = json.dumps({
         "company": "ROCKFORD PLAZA",
@@ -112,8 +112,8 @@ Visit www.HOMEGOODSFEEDBACK.com
 
     receipt = service._normalize_receipt_response(llm_content, {}, raw_text)
 
-    assert receipt["company"] == "HomeGoods"
-    assert receipt["storeName"] == "HomeGoods"
+    assert receipt["company"] == "Fresh Thyme Market"
+    assert receipt["storeName"] == "Fresh Thyme Market"
 
 
 def test_receipt_address_prefers_city_state_zip_after_street_over_feedback_text_code():

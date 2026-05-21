@@ -39,6 +39,24 @@ TOTAL 2.89
     assert result["confidence"]["lastFour"] >= 0.9
 
 
+def test_entity_engine_extracts_last_four_from_split_label_rows():
+    raw_text = """
+FRESHTHYME.COM
+45760 6TH AVENUE N
+CARD USED
+VISA
+LAST FOUR
+1234
+TOTAL 21.58
+"""
+
+    fields = ReceiptEntityExtractionEngine().extract(raw_text=raw_text)["fields"]
+
+    assert fields["cardUsed"] == "VISA"
+    assert fields["cardLast4"] == "1234"
+    assert fields["lastFour"] == "1234"
+
+
 def test_semantic_json_surfaces_receipt_entities():
     raw_text = """
 CVS

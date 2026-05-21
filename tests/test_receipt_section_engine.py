@@ -36,6 +36,20 @@ def test_section_engine_extracts_totals_payment_and_items_from_lines():
     assert result["payment"]["fields"]["approvalCode"] == "9A7B6C"
 
 
+def test_section_engine_extracts_last_four_from_split_payment_rows():
+    result = ReceiptSectionExtractionEngine().extract(lines=[
+        "FRESHTHYME.COM",
+        "TOTAL 21.58",
+        "CARD USED",
+        "VISA",
+        "LAST FOUR",
+        "1234",
+    ])
+
+    assert result["payment"]["fields"]["cardUsed"] == "VISA"
+    assert result["payment"]["fields"]["cardLast4"] == "1234"
+
+
 def test_section_engine_groups_ocr_boxes_by_y_position_and_alignment():
     engine = ReceiptSectionExtractionEngine()
     boxes = [
