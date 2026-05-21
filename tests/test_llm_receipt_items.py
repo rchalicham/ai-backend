@@ -112,8 +112,8 @@ Visit www.FRESHTHYMEFEEDBACK.com
 
     receipt = service._normalize_receipt_response(llm_content, {}, raw_text)
 
-    assert receipt["company"] == "Fresh Thyme Market"
-    assert receipt["storeName"] == "Fresh Thyme Market"
+    assert receipt["company"] == "Freshthyme"
+    assert receipt["storeName"] == "Freshthyme"
 
 
 def test_receipt_address_prefers_city_state_zip_after_street_over_feedback_text_code():
@@ -225,7 +225,7 @@ AMEX: 103.08
     assert receipt["total"] == "103.08"
 
 
-def test_lowes_company_corrects_pent_cop_ocr_variant():
+def test_company_preserves_uncertain_ocr_variant_without_merchant_specific_correction():
     service = LLMService()
     raw_text = """
 PENT COP
@@ -245,8 +245,8 @@ TOTAL: 103.08
 
     receipt = service._normalize_receipt_response(llm_content, {}, raw_text)
 
-    assert receipt["company"] == "LOWE'S HOME CENTERS, LLC"
-    assert receipt["storeName"] == "LOWE'S HOME CENTERS, LLC"
+    assert receipt["company"] == "PENT COP"
+    assert receipt["storeName"] == "PENT COP"
 
 
 def test_receipt_items_ignore_duplicate_later_ocr_passes_after_first_subtotal():

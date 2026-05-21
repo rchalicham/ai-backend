@@ -28,7 +28,7 @@ TOTAL 2.89
     result = ReceiptEntityExtractionEngine().extract(raw_text=raw_text)
     fields = result["fields"]
 
-    assert fields["merchant"] == "CVS Pharmacy"
+    assert fields["merchant"] == "CVS/Pharmacy"
     assert fields["address"] == "4140 ROAD 101 NORTH, PLYMOUTH, MN"
     assert fields["phone"] == "952-555-1212"
     assert fields["paymentMethod"] == "credit"
@@ -72,7 +72,7 @@ AUTH 014417
 
     semantic = ReceiptIntelligencePipeline().to_structured_json(raw_text=raw_text)
 
-    assert semantic["merchant"] == "CVS Pharmacy"
+    assert semantic["merchant"] == "CVS"
     assert semantic["address"] == "4140 ROAD 101 NORTH, PLYMOUTH, MN"
     assert semantic["cardUsed"] == "VISA"
     assert semantic["cardType"] == "VISA"
@@ -99,7 +99,7 @@ TOTAL 2.89
         raw_text=raw_text,
     )
 
-    assert normalized["merchant"] == "CVS Pharmacy"
+    assert normalized["merchant"] == "CVS"
     assert normalized["address"] == "4140 ROAD 101 NORTH, PLYMOUTH, MN"
     assert normalized["cardUsed"] == "VISA"
     assert normalized["cardLast4"] == "3442"

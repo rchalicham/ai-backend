@@ -268,30 +268,7 @@ class ReceiptDuplicateSuppressor:
 
 class MerchantNormalizer:
     PHARMACY_TERMS = ("PHARMACY", "PHARMA", "DRUG", "RX", "PRESCRIPTION")
-    KNOWN = {
-        "LOWES": ("LOWE'S HOME CENTERS, LLC", ("HOME CENTER", "HOME CENTERS", "PENT COP", "HOME CENFERS")),
-        "LOWE'S": ("LOWE'S HOME CENTERS, LLC", ("HOME CENTER", "HOME CENTERS", "PENT COP", "HOME CENFERS")),
-        "KADAI INDIAN KITCHEN": ("KADAI INDIAN KITCHEN", ("INDIAN", "KITCHEN")),
-        "FRESHTHYME": ("Fresh Thyme Market", ("FRESH THYME", "FRESH THYME MARKET")),
-        "FRESH THYME": ("Fresh Thyme Market", ("FRESHTHYME", "FRESH THYME MARKET")),
-        "THE HOME DEPOT": ("Home Depot", ("HOMEDEPOT",)),
-        "HOME DEPOT": ("Home Depot", ("HOMEDEPOT",)),
-        "TARGET": ("Target", ("TGT",)),
-        "WALMART": ("Walmart", ("WAL MART", "WAL-MART")),
-        "COSTCO": ("Costco", ("WHOLESALE",)),
-        "CVS/PHARMACY": ("CVS Pharmacy", ("CVS PHARMACY", "CVS", "C V S", "CV5", "CYS", "CVS PHARMA", "PHARMACY", "PHARMA", "4140 ROAD 101", "478-4612", "978-4612")),
-        "CVS PHARMACY": ("CVS Pharmacy", ("CVS/PHARMACY", "CVS", "C V S", "CV5", "CYS", "CVS PHARMA", "PHARMACY", "PHARMA", "4140 ROAD 101", "478-4612", "978-4612")),
-        "CVS": ("CVS Pharmacy", ("CVS/PHARMACY", "CVS PHARMACY", "C V S", "CV5", "CYS", "PHARMACY", "PHARMA", "4140 ROAD 101", "478-4612", "978-4612")),
-    }
-    DOMAIN_MERCHANTS = {
-        "FRESHTHYME.COM": "Fresh Thyme Market",
-        "FRESHTHYME": "Fresh Thyme Market",
-        "WALMART.COM": "Walmart",
-        "TARGET.COM": "Target",
-        "HOMEDEPOT.COM": "Home Depot",
-        "LOWES.COM": "LOWE'S HOME CENTERS, LLC",
-        "CVS.COM": "CVS Pharmacy",
-    }
+    KNOWN: dict[str, tuple[str, tuple[str, ...]]] = {}
     HIGH_CONFIDENCE_THRESHOLD = 0.82
     LOW_CONFIDENCE_PRESERVE_THRESHOLD = 0.72
     RECEIPT_NOISE = re.compile(
@@ -443,7 +420,7 @@ class MerchantNormalizer:
         found: list[tuple[str, str]] = []
         for match in re.finditer(r"\b(?:WWW\.)?([A-Z0-9][A-Z0-9-]{2,35})\.(COM|NET|ORG)\b", upper_combined):
             domain = f"{match.group(1)}.{match.group(2)}"
-            merchant = self.DOMAIN_MERCHANTS.get(domain) or self.DOMAIN_MERCHANTS.get(match.group(1))
+            merchant = self._merchant_from_domain_label(match.group(1))
             if merchant:
                 found.append((domain, merchant))
         return found
@@ -452,6 +429,15 @@ class MerchantNormalizer:
         for domain, merchant in self._domain_evidence(line.upper()):
             return merchant
         return ""
+
+    def _merchant_from_domain_label(self, label: str) -> str:
+        cleaned = re.sub(r"(?:FEEDBACK|SURVEY|REWARDS|REWARD)$", "", str(label or "").upper())
+        cleaned = re.sub(r"[-_]+", " ", cleaned)
+        cleaned = re.sub(r"[^A-Z0-9 ]+", "", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        if not cleaned or cleaned in {"WWW", "EMAIL", "RECEIPT"}:
+            return ""
+        return cleaned.title()
 
     def generate_candidates(self, raw_text: str, candidate: str = "") -> list[dict[str, Any]]:
         generated: list[dict[str, Any]] = []
@@ -487,54 +473,15 @@ class MerchantNormalizer:
         return [item["text"] for item in self.generate_candidates(raw_text, candidate)]
 
     def _recover_partial_ocr_fragments(self, lines: list[str]) -> list[str]:
-        recovered: list[str] = []
-        upper = "\n".join(lines[:12]).upper()
-        canonical = self._canonical(upper)
-        if re.search(r"\bC\s*V\s*S\b|\bC[VU][S5]\b", canonical) and any(term in canonical for term in self.PHARMACY_TERMS):
-            recovered.append("CVS Pharmacy")
-        if any(term in canonical for term in self.PHARMACY_TERMS) and "ROAD 101" in canonical:
-            recovered.append("CVS Pharmacy")
-        return recovered
+        return []
 
     def _address_phone_score(self, merchant: str, combined: str, reasons: list[str], evidence: list[dict[str, Any]]) -> float:
-        if merchant == "CVS Pharmacy" and re.search(r"\b4140\s+ROAD\s+101\b", combined) and re.search(r"\bPLY(?:MOUTH|NQUTH)\b", combined):
-            reasons.append("address:4140 ROAD 101 PLYMOUTH")
-            evidence.append({"type": "address_match", "value": "4140 ROAD 101 PLYMOUTH", "weight": 0.86, "confidence": 0.9})
-            return 0.9
-        if merchant == "CVS Pharmacy" and re.search(r"\b(?:478|978)[-.\s]?4612\b", combined):
-            reasons.append("phone:pharmacy-store")
-            evidence.append({"type": "phone_match", "value": "478/978-4612", "weight": 0.84, "confidence": 0.84})
-            return 0.84
-        if merchant == "CVS Pharmacy" and re.search(r"\b4140\s+ROAD\s+101\b", combined) and any(term in combined for term in self.PHARMACY_TERMS):
-            reasons.append("address:pharmacy+4140 ROAD 101")
-            evidence.append({"type": "address_match", "value": "pharmacy+4140 ROAD 101", "weight": 0.82, "confidence": 0.88})
-            return 0.88
         return 0.0
 
     def _semantic_store_score(self, merchant: str, combined: str, reasons: list[str], evidence: list[dict[str, Any]]) -> float:
-        if merchant == "CVS Pharmacy":
-            has_cvs_like = self._similarity("CVS", combined[:160]) >= 72 or re.search(r"\bC\s*V\s*S\b|\bC[VU][S5]\b", combined)
-            has_pharmacy = any(term in combined for term in self.PHARMACY_TERMS) or "PHARHACY" in combined or "PHARNACY" in combined
-            if has_cvs_like and has_pharmacy:
-                reasons.append("semantic:cvs+pharmacy")
-                evidence.append({"type": "semantic_validation", "value": "cvs+pharmacy", "weight": 0.65, "confidence": 0.92})
-                return 0.92
-            if has_pharmacy and "ROAD 101" in combined:
-                reasons.append("semantic:pharmacy+known_address")
-                evidence.append({"type": "semantic_validation", "value": "pharmacy+known_address", "weight": 0.62, "confidence": 0.86})
-                return 0.86
         return 0.0
 
     def _partial_ocr_score(self, merchant: str, windows: list[dict[str, Any]], combined: str, reasons: list[str], evidence: list[dict[str, Any]]) -> float:
-        if merchant != "CVS Pharmacy":
-            return 0.0
-        canonical_windows = " ".join(self._canonical(item["text"]) for item in windows[:12])
-        has_cvs_fragment = bool(re.search(r"\bC\s*V\s*S\b|\bCVS\b|\bCV5\b|\bCYS\b", canonical_windows))
-        has_store_type = any(term in canonical_windows or term in combined for term in self.PHARMACY_TERMS)
-        if has_cvs_fragment and has_store_type:
-            reasons.append("partial_ocr:cvs_fragment+store_type")
-            evidence.append({"type": "logo_or_header_ocr", "value": "cvs_fragment+store_type", "weight": 0.74, "confidence": 0.9})
-            return 0.9
         return 0.0
 
     def _similarity(self, left: str, right: str) -> float:
@@ -555,9 +502,6 @@ class MerchantNormalizer:
         replacements = {
             "PHARHACY": "PHARMACY",
             "PHARNACY": "PHARMACY",
-            "CV5": "CVS",
-            "CYS": "CVS",
-            "C V S": "CVS",
             "PLYNQUTH": "PLYMOUTH",
         }
         for wrong, right in replacements.items():
@@ -575,7 +519,8 @@ class MerchantNormalizer:
     def _title_preserving_acronyms(self, value: str) -> str:
         words = []
         for word in value.split():
-            words.append(word if word.isupper() and len(word) <= 4 else word.title())
+            parts = [part if part.isupper() else part.title() for part in word.split("/")]
+            words.append("/".join(parts))
         return " ".join(words)
 
 

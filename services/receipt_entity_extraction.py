@@ -23,7 +23,7 @@ STREET_TERMS = (
     "TRL", "PLAZA", "PLZ", "SUITE", "STE", "UNIT", "BUILDING", "BLDG",
 )
 HEADER_SKIP_TERMS = (
-    "REG", "TRN", "CSHR", "STR", "STORE", "PHARMACY", "RECEIPT", "TOTAL", "SUBTOTAL",
+    "REG", "TRN", "CSHR", "STR", "STORE", "RECEIPT", "TOTAL", "SUBTOTAL",
     "TAX", "VISA", "MASTERCARD", "AUTH", "APPROVAL", "CARD",
 )
 US_STATE_CODES = {
@@ -159,10 +159,6 @@ class HeaderEntityParser:
 
     def _merchant(self, lines: list[EntityLine]) -> EntityCandidate | None:
         header = lines[:8]
-        for line in header:
-            upper = line.text.upper()
-            if "CVS" in upper or ("PHARMACY" in upper and any("ROAD 101" in candidate.text.upper() for candidate in lines[:12])):
-                return EntityCandidate("CVS Pharmacy", 0.96, "header.keyword", [line.index], {"line": line.text})
         for line in header[:5]:
             upper = line.text.upper()
             if re.search(r"[A-Za-z]{3,}", line.text) and not re.search(r"\d{4,}", line.text) and not any(term in upper for term in HEADER_SKIP_TERMS):
@@ -268,7 +264,11 @@ class HeaderEntityParser:
         return None
 
     def _title(self, text: str) -> str:
-        return " ".join(word if word.isupper() and len(word) <= 4 else word.title() for word in compact(text).split())
+        words = []
+        for word in compact(text).split():
+            parts = [part if part.isupper() else part.title() for part in word.split("/")]
+            words.append("/".join(parts))
+        return " ".join(words)
 
 
 class PaymentEntityParser:

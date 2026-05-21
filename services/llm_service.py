@@ -943,24 +943,12 @@ class LLMService:
         return ""
 
     def _infer_company_name(self, raw_text: str, fallback: str) -> str:
-        upper = (raw_text or "").upper()
         normalized = self.receipt_intelligence.merchants.normalize(raw_text, fallback)
         if normalized and normalized != fallback:
             return normalized
         merchant_clue = self._infer_merchant_from_receipt_clues(raw_text)
         if merchant_clue:
             return merchant_clue
-        if (
-            "LOWES" in upper
-            or "LOWE'S" in upper
-            or "HOME CENTERS" in upper
-            or "HOME CENFERS" in upper
-            or "HOME CRENSERS" in upper
-            or "LNWE'S" in upper
-            or "PNWE'S" in upper
-            or "PENT COP" in upper
-        ):
-            return "LOWE'S HOME CENTERS, LLC"
         return fallback
 
     def _choose_company_name(self, raw_company: Any, fallback_company: Any, inferred_company: str) -> str:
@@ -990,27 +978,6 @@ class LLMService:
         for match in re.finditer(r"\bVISIT\s+(?:WWW\.)?([A-Z0-9][A-Z0-9-]{2,35})(?:FEEDBACK|SURVEY|REWARDS)?\.(?:COM|NET|ORG)\b", text, flags=re.IGNORECASE):
             candidates.append(match.group(1))
 
-        upper = (raw_text or "").upper()
-        known_merchants = {
-            "LOWES": "LOWE'S HOME CENTERS, LLC",
-            "LOWE'S": "LOWE'S HOME CENTERS, LLC",
-            "PENT COP": "LOWE'S HOME CENTERS, LLC",
-            "TARGET": "Target",
-            "WALMART": "Walmart",
-            "COSTCO": "Costco",
-            "CVS": "CVS Pharmacy",
-            "CVS PHARMACY": "CVS Pharmacy",
-            "CVS/PHARMACY": "CVS Pharmacy",
-            "MENARDS": "Menards",
-            "HOME DEPOT": "Home Depot",
-            "THE HOME DEPOT": "Home Depot",
-            "TJ MAXX": "TJ Maxx",
-            "MARSHALLS": "Marshalls",
-        }
-        for token, merchant in known_merchants.items():
-            if re.search(rf"\b{re.escape(token)}\b", upper):
-                candidates.append(merchant)
-
         normalized = [self._normalize_merchant_candidate(candidate) for candidate in candidates]
         normalized = [candidate for candidate in normalized if candidate]
         if not normalized:
@@ -1026,21 +993,7 @@ class LLMService:
         if not cleaned or len(cleaned) < 3:
             return ""
 
-        upper = cleaned.upper().replace(" ", "")
-        aliases = {
-            "LOWES": "LOWE'S HOME CENTERS, LLC",
-            "LOWE'S": "LOWE'S HOME CENTERS, LLC",
-            "PENTCOP": "LOWE'S HOME CENTERS, LLC",
-            "THEHOMEDEPOT": "Home Depot",
-            "HOMEDEPOT": "Home Depot",
-            "CVS": "CVS Pharmacy",
-            "CVSPHARMACY": "CVS Pharmacy",
-            "TJMAXX": "TJ Maxx",
-        }
-        for alias, merchant in aliases.items():
-            if alias in upper:
-                return merchant
-        return aliases.get(upper, cleaned.title())
+        return cleaned.title()
 
     def _clean_address_line(self, line: str) -> str:
         cleaned = re.sub(r"\s+", " ", str(line or "")).strip(" -_:;")
