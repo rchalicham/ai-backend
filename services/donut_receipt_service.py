@@ -11,6 +11,7 @@ from typing import Any
 
 import httpx
 
+from services.receipt_image_isolation import ReceiptImageIsolationService
 from services.receipt_row_consolidation import ReceiptRowConsolidationPipeline
 
 
@@ -68,6 +69,9 @@ class DonutReceiptService:
         self._load_lock = asyncio.Lock()
         self._inference_semaphore = asyncio.Semaphore(max(1, self.max_concurrency))
         self.row_consolidation = ReceiptRowConsolidationPipeline()
+        self.image_isolation = ReceiptImageIsolationService(
+            debug_preview=os.getenv("RECEIPT_ISOLATION_DEBUG_PREVIEW", "false").lower() in {"1", "true", "yes", "on"}
+        )
 
     def decode_base64_image(self, image_base64: str) -> bytes:
         value = (image_base64 or "").strip()
@@ -99,16 +103,20 @@ class DonutReceiptService:
                 model=self.model_name,
                 warning="No processed receipt image was provided to Donut.",
             ).to_dict()
+        isolation = self.image_isolation.isolate(image_bytes)
+        isolated_image_bytes = isolation.image_bytes
         if not self.enabled:
             return DonutReceiptResult(
                 available=False,
                 model=self.model_name,
                 warning="Donut receipt model is disabled. Set DONUT_RECEIPT_ENABLED=true in the model service container.",
-            ).to_dict()
+            ).to_dict() | {"receiptIsolation": isolation.diagnostics}
         async with self._inference_semaphore:
             await self._ensure_loaded()
             loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(None, self._infer_sync, image_bytes)
+            result = await loop.run_in_executor(None, self._infer_sync, isolated_image_bytes)
+            result["receiptIsolation"] = isolation.diagnostics
+            return result
 
     async def _ensure_loaded(self) -> None:
         if self._model is not None and self._processor is not None:

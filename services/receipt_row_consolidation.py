@@ -63,10 +63,27 @@ class CandidateRow:
     raw: dict[str, Any] = field(default_factory=dict)
     section: str = "unknown"
     reasons: list[str] = field(default_factory=list)
+    line_index: int | None = None
 
     @property
     def amount_value(self) -> float:
         return _numeric_amount(self.amount)
+
+    @property
+    def y(self) -> float | None:
+        if isinstance(self.bbox, dict):
+            y = self.bbox.get("y", self.bbox.get("top"))
+            try:
+                return float(y)
+            except (TypeError, ValueError):
+                return None
+        if isinstance(self.raw, dict):
+            y = self.raw.get("y")
+            try:
+                return float(y)
+            except (TypeError, ValueError):
+                return None
+        return None
 
 
 def _compact(value: Any) -> str:
@@ -194,6 +211,7 @@ class ReceiptCandidateExtractor:
         sections: list[ReceiptSection],
         segmenter: ReceiptSectionSegmenter,
         section_items: list[dict[str, Any]] | None = None,
+        ocr_blocks: list[dict[str, Any]] | None = None,
     ) -> list[CandidateRow]:
         candidates: list[CandidateRow] = []
         for index, item in enumerate(donut.get("items") or []):
@@ -207,6 +225,7 @@ class ReceiptCandidateExtractor:
                 confidence=float(item.get("confidence") or donut.get("confidence") or 0.55),
                 bbox=item.get("bbox") if isinstance(item.get("bbox"), dict) else None,
                 raw=item,
+                line_index=item.get("lineIndex") if isinstance(item.get("lineIndex"), int) else None,
             )
             row.section = segmenter.locate_text(row.name, lines, sections)
             candidates.append(row)
@@ -214,6 +233,7 @@ class ReceiptCandidateExtractor:
         raw = donut.get("raw") if isinstance(donut.get("raw"), dict) else {}
         self._extract_menu(raw, candidates, lines, sections, segmenter)
         self._extract_section_items(section_items or [], candidates)
+        self._extract_ocr_box_rows(ocr_blocks or [], candidates, lines, sections)
         for index, line in enumerate(lines):
             match = re.search(r"(?P<name>.+?)\s+(?P<amount>-?\d{1,6}(?:[.,]\d{2}))\s*[A-Z]?$", line)
             if not match:
@@ -226,8 +246,98 @@ class ReceiptCandidateExtractor:
                 confidence=0.64 if section == "items" else 0.42,
                 raw={"line": line, "lineIndex": index},
                 section=section,
+                line_index=index,
             ))
         return candidates
+
+    def _extract_ocr_box_rows(
+        self,
+        boxes: list[dict[str, Any]],
+        candidates: list[CandidateRow],
+        lines: list[str],
+        sections: list[ReceiptSection],
+    ) -> None:
+        normalized_boxes = []
+        for box in boxes:
+            if not isinstance(box, dict):
+                continue
+            text = _compact(box.get("text") or box.get("value"))
+            if not text:
+                continue
+            bbox = box.get("bbox") if isinstance(box.get("bbox"), dict) else {}
+            try:
+                x = float(box.get("x", bbox.get("x", bbox.get("left", 0))) or 0)
+                y = float(box.get("y", bbox.get("y", bbox.get("top", 0))) or 0)
+                width = float(box.get("width", bbox.get("width", bbox.get("w", 0))) or 0)
+                height = float(box.get("height", bbox.get("height", bbox.get("h", 12))) or 12)
+                confidence = float(box.get("confidence", box.get("conf", 0.62)) or 0.62)
+            except (TypeError, ValueError):
+                continue
+            normalized_boxes.append({
+                "text": text,
+                "x": x,
+                "y": y,
+                "width": width,
+                "height": height,
+                "confidence": confidence,
+                "raw": box,
+            })
+        if not normalized_boxes:
+            return
+        normalized_boxes.sort(key=lambda item: (item["y"], item["x"]))
+        rows: list[list[dict[str, Any]]] = []
+        for box in normalized_boxes:
+            target = None
+            for row in rows:
+                row_y = sum(item["y"] for item in row) / max(len(row), 1)
+                row_height = max(item["height"] for item in row)
+                if abs(row_y - box["y"]) <= max(10.0, row_height * 0.72):
+                    target = row
+                    break
+            if target is None:
+                rows.append([box])
+            else:
+                target.append(box)
+        for row_index, row in enumerate(rows):
+            ordered = sorted(row, key=lambda item: item["x"])
+            text = _compact(" ".join(item["text"] for item in ordered))
+            match = re.search(r"(?P<name>.+?)\s+(?P<amount>-?\d{1,6}(?:[.,]\d{2}))\s*[A-Z]?$", text)
+            if not match:
+                continue
+            y_values = [item["y"] for item in ordered]
+            x_values = [item["x"] for item in ordered]
+            right_values = [item["x"] + item["width"] for item in ordered]
+            bottom_values = [item["y"] + item["height"] for item in ordered]
+            line_index = self._nearest_line_index(text, lines)
+            section = next((section.kind for section in sections if line_index is not None and section.start <= line_index <= section.end), "items")
+            candidates.append(CandidateRow(
+                source="ocr.box.row",
+                name=_compact(match.group("name")),
+                amount=_amount(match.group("amount")),
+                confidence=sum(item["confidence"] for item in ordered) / max(len(ordered), 1),
+                bbox={
+                    "x": min(x_values),
+                    "y": min(y_values),
+                    "width": max(right_values) - min(x_values),
+                    "height": max(bottom_values) - min(y_values),
+                },
+                raw={"line": text, "boxCount": len(ordered), "rowIndex": row_index},
+                section=section,
+                line_index=line_index,
+            ))
+
+    def _nearest_line_index(self, text: str, lines: list[str]) -> int | None:
+        key = _canonical_name(text)
+        if not key:
+            return None
+        best_index = None
+        best_score = 0.0
+        for index, line in enumerate(lines):
+            score = _similarity(key, line)
+            if score > best_score:
+                best_score = score
+                best_index = index
+        return best_index if best_score >= 78 else None
 
     def _extract_section_items(self, items: list[dict[str, Any]], candidates: list[CandidateRow]) -> None:
         for item in items:
@@ -288,7 +398,7 @@ class ReceiptRowValidator:
         name = _compact(row.name)
         canonical = _canonical_name(name)
         upper = name.upper()
-        if row.confidence < 0.35:
+        if row.confidence < 0.42:
             reasons.append("low_source_confidence")
         if not row.amount or row.amount_value <= 0:
             reasons.append("missing_or_zero_amount")
@@ -313,7 +423,7 @@ class ReceiptRowValidator:
         if row.section in {"totals", "payment", "footer"}:
             reasons.append(f"excluded_section_{row.section}")
         receipt_amounts = {_amount(value) for value in facts.values() if _amount(value)}
-        if row.amount in receipt_amounts and len(canonical.split()) <= 2:
+        if row.amount in receipt_amounts and len(canonical.split()) <= 2 and row.confidence < 0.75:
             reasons.append("weak_name_matches_receipt_total")
         if len(canonical.split()) == 1 and len(canonical) <= 5:
             reasons.append("short_single_token_product_name")
@@ -327,6 +437,7 @@ class ReceiptRowValidator:
             "invalid_product_name",
             "missing_or_zero_amount",
             "survey_or_barcode_numeric_row",
+            "low_source_confidence",
         }
         if "weak_name_matches_receipt_total" in reasons and "short_single_token_product_name" in reasons:
             hard_rejects.add("weak_name_matches_receipt_total")
@@ -383,7 +494,10 @@ class ReceiptDuplicateClusterer:
             for cluster in clusters:
                 representative = cluster[0]
                 same_price = abs(representative.amount_value - row.amount_value) <= 0.01
-                similar = _similarity(representative.name, row.name) >= 86
+                similarity = _similarity(representative.name, row.name)
+                nearby_y = self._nearby_y(representative, row)
+                overlapping_tokens = self._overlapping_product_tokens(representative.name, row.name)
+                similar = similarity >= 82 or (nearby_y and similarity >= 58) or (nearby_y and overlapping_tokens >= 2)
                 if same_price and similar:
                     target = cluster
                     break
@@ -406,6 +520,55 @@ class ReceiptDuplicateClusterer:
             "confidence": round(confidence, 3),
             "sourceRows": len(cluster),
             "sources": sorted({row.source for row in cluster}),
+            "rowConfidenceTrace": self._cluster_trace(best, cluster, validator),
+        }
+
+    def duplicate_diagnostics(self, clusters: list[list[CandidateRow]], validator: ReceiptRowValidator) -> list[dict[str, Any]]:
+        diagnostics = []
+        for cluster_index, cluster in enumerate(clusters):
+            if len(cluster) <= 1:
+                continue
+            best = max(cluster, key=lambda row: (validator.score(row, row.reasons), len(_canonical_name(row.name)), row.confidence))
+            diagnostics.append({
+                "clusterIndex": cluster_index,
+                "selected": self._candidate_trace(best, validator),
+                "duplicates": [self._candidate_trace(row, validator) for row in cluster if row is not best],
+                "reason": "same_price_similar_text_or_nearby_y",
+            })
+        return diagnostics
+
+    def _nearby_y(self, left: CandidateRow, right: CandidateRow) -> bool:
+        if left.line_index is not None and right.line_index is not None and abs(left.line_index - right.line_index) <= 1:
+            return True
+        if left.y is None or right.y is None:
+            return False
+        return abs(left.y - right.y) <= 22
+
+    def _overlapping_product_tokens(self, left: str, right: str) -> int:
+        left_tokens = {token for token in _canonical_name(left).split() if len(token) >= 3}
+        right_tokens = {token for token in _canonical_name(right).split() if len(token) >= 3}
+        return len(left_tokens & right_tokens)
+
+    def _candidate_trace(self, row: CandidateRow, validator: ReceiptRowValidator) -> dict[str, Any]:
+        return {
+            "source": row.source,
+            "name": row.name,
+            "canonicalName": _canonical_name(row.name),
+            "amount": row.amount,
+            "qty": row.qty,
+            "section": row.section,
+            "sourceConfidence": round(float(row.confidence or 0), 3),
+            "validatorScore": validator.score(row, row.reasons),
+            "bbox": row.bbox or {},
+            "lineIndex": row.line_index,
+            "reasons": row.reasons,
+        }
+
+    def _cluster_trace(self, best: CandidateRow, cluster: list[CandidateRow], validator: ReceiptRowValidator) -> dict[str, Any]:
+        return {
+            "selected": self._candidate_trace(best, validator),
+            "clusterSize": len(cluster),
+            "alternates": [self._candidate_trace(row, validator) for row in cluster if row is not best],
         }
 
     def _clean_name(self, value: str) -> str:
@@ -428,7 +591,18 @@ class ReceiptSubtotalReconciler:
             "target": f"{target:.2f}" if target else "",
             "matched": False,
             "warnings": [],
+            "itemCountTarget": int(facts.get("itemCount") or 0) if str(facts.get("itemCount") or "").isdigit() else None,
+            "itemCountActual": len(items),
         }
+        if diagnostics["itemCountTarget"] is not None and diagnostics["itemCountActual"] != diagnostics["itemCountTarget"]:
+            diagnostics["warnings"].append("item_count_does_not_match_receipt_count")
+            selected_by_count = self._best_count_subset(items, diagnostics["itemCountTarget"], target)
+            if selected_by_count:
+                items = selected_by_count
+                item_sum = sum(_numeric_amount(item.get("amount")) for item in items)
+                diagnostics["itemSum"] = f"{item_sum:.2f}" if item_sum else "0"
+                diagnostics["itemCountActual"] = len(items)
+                diagnostics["warnings"].append("item_count_subset_reconciled")
         if not items or not target:
             return items, diagnostics
         if abs(item_sum - target) <= max(0.25, target * 0.03):
@@ -444,6 +618,22 @@ class ReceiptSubtotalReconciler:
                 return selected, diagnostics
         diagnostics["warnings"].append("item_sum_does_not_match_receipt_total")
         return items, diagnostics
+
+    def _best_count_subset(self, items: list[dict[str, Any]], target_count: int, target_total: float) -> list[dict[str, Any]]:
+        if target_count <= 0 or len(items) <= target_count or len(items) > 20:
+            return []
+        ranked = sorted(items, key=lambda item: float(item.get("confidence") or 0), reverse=True)
+        if not target_total:
+            return ranked[:target_count]
+        best_subset: list[dict[str, Any]] = []
+        best_delta = float("inf")
+        for subset in itertools.combinations(ranked, target_count):
+            total = sum(_numeric_amount(item.get("amount")) for item in subset)
+            delta = abs(total - target_total)
+            if delta < best_delta:
+                best_delta = delta
+                best_subset = list(subset)
+        return best_subset if best_subset and best_delta <= max(0.5, target_total * 0.08) else []
 
     def _best_subset(self, items: list[dict[str, Any]], target: float) -> list[dict[str, Any]]:
         if len(items) > 16:
@@ -485,6 +675,8 @@ class ReceiptRowConsolidationPipeline:
             source_lines = [line for line in raw_text.splitlines() if line.strip()]
         sections = self.segmenter.segment(source_lines, ocr_blocks)
         facts = self._facts(donut, parser_json)
+        if not facts.get("itemCount"):
+            facts["itemCount"] = self._infer_item_count("\n".join(source_lines) or raw_text)
         section_result = self.section_engine.extract(raw_text=raw_text, lines=source_lines, ocr_blocks=ocr_blocks)
         self._merge_section_facts(facts, section_result)
         entity_result = self.entity_engine.extract(raw_text=raw_text, lines=source_lines, ocr_blocks=ocr_blocks)
@@ -496,6 +688,7 @@ class ReceiptRowConsolidationPipeline:
             sections,
             self.segmenter,
             section_items=section_result.get("items") if isinstance(section_result.get("items"), list) else [],
+            ocr_blocks=ocr_blocks,
         )
         boundary_lock = self._section_boundary_lock(section_result)
         self._apply_boundary_lock(candidates, boundary_lock)
@@ -517,13 +710,15 @@ class ReceiptRowConsolidationPipeline:
                     "reasons": reasons,
                 })
         clusters = self.clusterer.cluster(accepted)
+        duplicate_clusters = self.clusterer.duplicate_diagnostics(clusters, self.validator)
         consolidated = [self.clusterer.consolidate(cluster, self.validator, facts) for cluster in clusters]
         consolidated, reconciliation = self.reconciler.reconcile(consolidated, facts)
         consolidated = [{**item, "id": index + 1} for index, item in enumerate(consolidated)]
-        merchant = self.merchants.normalize(
+        merchant_resolution = self.merchants.resolve(
             "\n".join(source_lines) or raw_text,
             str(facts.get("merchant") or donut.get("merchant") or parser_json.get("company") or parser_json.get("storeName") or ""),
         )
+        merchant = merchant_resolution["merchant"]
         confidence = self._overall_confidence(consolidated, reconciliation, merchant, candidates, rejected)
         retry_plan = self._retry_plan(consolidated, reconciliation, confidence)
         normalized = {
@@ -532,6 +727,7 @@ class ReceiptRowConsolidationPipeline:
             "address": facts.get("address", ""),
             "storeAddress": facts.get("storeAddress", facts.get("address", "")),
             "phone": facts.get("phone", ""),
+            "merchantConfidenceTrace": merchant_resolution,
             "items": consolidated,
             "subtotal": facts.get("subtotal", ""),
             "tax": facts.get("tax", ""),
@@ -558,12 +754,15 @@ class ReceiptRowConsolidationPipeline:
                 "acceptedCandidateCount": len(accepted),
                 "rejectedCandidateCount": len(rejected),
                 "clusterCount": len(clusters),
+                "duplicateClusterCount": len(duplicate_clusters),
                 "sections": [section.__dict__ for section in sections],
                 "boundaryLock": boundary_lock,
                 "reconciliation": reconciliation,
                 "confidence": confidence,
                 "retryPlan": retry_plan,
                 "rejectedRows": rejected[:80],
+                "duplicateRows": duplicate_clusters[:80],
+                "rowConfidenceTraces": [item.get("rowConfidenceTrace", {}) for item in consolidated[:120]],
                 "rapidFuzzAvailable": fuzz is not None,
                 "llamaValidation": {
                     "strategy": "receipt/document-understanding run_llama=true performs final semantic validation",
@@ -598,7 +797,29 @@ class ReceiptRowConsolidationPipeline:
             "address": _compact(donut.get("address") or donut.get("storeAddress") or parser_json.get("address") or parser_json.get("storeAddress")),
             "storeAddress": _compact(donut.get("storeAddress") or donut.get("address") or parser_json.get("storeAddress") or parser_json.get("address")),
             "phone": _compact(donut.get("phone") or parser_json.get("phone")),
+            "itemCount": self._item_count(donut, parser_json),
         }
+
+    def _item_count(self, donut: dict[str, Any], parser_json: dict[str, Any]) -> str:
+        values = [
+            donut.get("itemCount"),
+            donut.get("soldItemCount"),
+            donut.get("item_count"),
+            parser_json.get("itemCount"),
+            parser_json.get("soldItemCount"),
+            parser_json.get("item_count"),
+        ]
+        raw = donut.get("raw") if isinstance(donut.get("raw"), dict) else {}
+        values.extend([raw.get("itemCount"), raw.get("soldItemCount"), raw.get("item_count")])
+        for value in values:
+            match = re.search(r"\b\d{1,3}\b", str(value or ""))
+            if match:
+                return match.group(0)
+        return ""
+
+    def _infer_item_count(self, raw_text: str) -> str:
+        matches = re.findall(r"\b(?:ITEM\s+COUNT|SOLD\s+ITEMS?|ITEMS\s+SOLD)\D{0,12}(\d{1,3})\b", raw_text or "", flags=re.IGNORECASE)
+        return matches[-1] if matches else ""
 
     def _merge_section_facts(self, facts: dict[str, str], section_result: dict[str, Any]) -> None:
         totals = section_result.get("totals", {}) if isinstance(section_result, dict) else {}

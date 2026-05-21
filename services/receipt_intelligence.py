@@ -142,6 +142,7 @@ class SemanticBlock:
 @dataclass
 class ParsedReceiptCandidate:
     merchant: str = ""
+    merchant_trace: dict[str, Any] = field(default_factory=dict)
     lines: list[ReconstructedLine] = field(default_factory=list)
     items: list[dict[str, Any]] = field(default_factory=list)
     facts: dict[str, str] = field(default_factory=dict)
@@ -271,7 +272,9 @@ class MerchantNormalizer:
         "LOWES": ("LOWE'S HOME CENTERS, LLC", ("HOME CENTER", "HOME CENTERS", "PENT COP", "HOME CENFERS")),
         "LOWE'S": ("LOWE'S HOME CENTERS, LLC", ("HOME CENTER", "HOME CENTERS", "PENT COP", "HOME CENFERS")),
         "KADAI INDIAN KITCHEN": ("KADAI INDIAN KITCHEN", ("INDIAN", "KITCHEN")),
-        "HOMEGOODS": ("HomeGoods", ("HOME GOODS", "VALUES YOUR FEEDBACK")),
+        "FRESHTHYME": ("Fresh Thyme Market", ("FRESH THYME", "FRESH THYME MARKET")),
+        "FRESH THYME": ("Fresh Thyme Market", ("FRESHTHYME", "FRESH THYME MARKET")),
+        "HOMEGOODS": ("HomeGoods", ("HOME GOODS",)),
         "THE HOME DEPOT": ("Home Depot", ("HOMEDEPOT",)),
         "HOME DEPOT": ("Home Depot", ("HOMEDEPOT",)),
         "TARGET": ("Target", ("TGT",)),
@@ -281,6 +284,18 @@ class MerchantNormalizer:
         "CVS PHARMACY": ("CVS Pharmacy", ("CVS/PHARMACY", "CVS", "C V S", "CV5", "CYS", "CVS PHARMA", "PHARMACY", "PHARMA", "4140 ROAD 101", "478-4612", "978-4612")),
         "CVS": ("CVS Pharmacy", ("CVS/PHARMACY", "CVS PHARMACY", "C V S", "CV5", "CYS", "PHARMACY", "PHARMA", "4140 ROAD 101", "478-4612", "978-4612")),
     }
+    DOMAIN_MERCHANTS = {
+        "FRESHTHYME.COM": "Fresh Thyme Market",
+        "FRESHTHYME": "Fresh Thyme Market",
+        "WALMART.COM": "Walmart",
+        "TARGET.COM": "Target",
+        "HOMEGOODS.COM": "HomeGoods",
+        "HOMEDEPOT.COM": "Home Depot",
+        "LOWES.COM": "LOWE'S HOME CENTERS, LLC",
+        "CVS.COM": "CVS Pharmacy",
+    }
+    HIGH_CONFIDENCE_THRESHOLD = 0.82
+    LOW_CONFIDENCE_PRESERVE_THRESHOLD = 0.72
     RECEIPT_NOISE = re.compile(
         r"\b(?:REG|TRN|CSHR|STR|STORE|SUBTOTAL|TOTAL|TAX|VISA|CREDIT|DEBIT|APPROVED|AUTH|REF|AID|TERMINAL|"
         r"CHANGE|RETURN|POLICY|RECEIPT|DATE|PHARMACY\s*:\s*\d|NO SIGNATURE)\b",
@@ -288,56 +303,157 @@ class MerchantNormalizer:
     )
 
     def normalize(self, raw_text: str, candidate: str = "") -> str:
+        return self.resolve(raw_text, candidate)["merchant"]
+
+    def resolve(self, raw_text: str, candidate: str = "") -> dict[str, Any]:
         scored = self.candidates(raw_text, candidate)
-        if scored:
-            return scored[0]["merchant"]
+        raw_merchant = self._raw_ocr_merchant(raw_text, candidate)
+        top = scored[0] if scored else None
+        rejected = scored[1:8] if scored else []
+        if top and top["confidence"] >= self.HIGH_CONFIDENCE_THRESHOLD:
+            return {
+                "merchant": top["merchant"],
+                "confidence": top["confidence"],
+                "source": "normalized",
+                "rawMerchant": raw_merchant,
+                "selectedCandidate": top,
+                "evidence": top.get("evidence", []),
+                "rejectedCandidates": rejected,
+                "preservedRawOcr": False,
+            }
+        if raw_merchant:
+            return {
+                "merchant": raw_merchant,
+                "confidence": round(float(top.get("confidence", 0.0)) if top else 0.58, 3),
+                "source": "raw_ocr_preserved",
+                "rawMerchant": raw_merchant,
+                "selectedCandidate": top,
+                "evidence": top.get("evidence", []) if top else [],
+                "rejectedCandidates": rejected,
+                "preservedRawOcr": True,
+                "reason": "normalized_candidate_below_confidence_threshold",
+            }
+        if top and top["confidence"] >= self.LOW_CONFIDENCE_PRESERVE_THRESHOLD:
+            return {
+                "merchant": top["merchant"],
+                "confidence": top["confidence"],
+                "source": "normalized_low_confidence_no_raw_ocr",
+                "rawMerchant": "",
+                "selectedCandidate": top,
+                "evidence": top.get("evidence", []),
+                "rejectedCandidates": rejected,
+                "preservedRawOcr": False,
+            }
+        return {
+            "merchant": _compact_text(candidate),
+            "confidence": 0.0,
+            "source": "empty",
+            "rawMerchant": raw_merchant,
+            "selectedCandidate": top,
+            "evidence": [],
+            "rejectedCandidates": rejected,
+            "preservedRawOcr": False,
+        }
+
+    def _raw_ocr_merchant(self, raw_text: str, candidate: str = "") -> str:
+        if _compact_text(candidate) and not self.RECEIPT_NOISE.search(candidate):
+            return self._title_preserving_acronyms(_compact_text(candidate))
         first_lines = [_compact_text(line) for line in raw_text.splitlines()[:8] if _compact_text(line)]
         for line in first_lines:
+            domain = self._domain_merchant_from_line(line)
+            if domain:
+                return domain
             if self._looks_like_header_merchant(line):
                 return self._title_preserving_acronyms(line)
-        return _compact_text(candidate)
+        return ""
 
     def candidates(self, raw_text: str, candidate: str = "") -> list[dict[str, Any]]:
         combined = _compact_text(f"{candidate}\n{raw_text}")
         upper_combined = combined.upper()
+        raw_upper = _compact_text(raw_text).upper()
         generated_candidates = self.generate_candidates(raw_text, candidate)
         text_candidates = [item["text"] for item in generated_candidates]
         scored: list[dict[str, Any]] = []
+        for domain, merchant in self._domain_evidence(upper_combined):
+            scored.append(self._candidate(
+                merchant,
+                0.98,
+                [f"domain:{domain}"],
+                [{"type": "domain_ocr", "value": domain, "weight": 1.0, "confidence": 0.98}],
+                text_candidates,
+            ))
         for token, merchant_payload in self.KNOWN.items():
             merchant, aliases = merchant_payload
             alias_terms = (token, *aliases)
             score = 0.0
             reasons: list[str] = []
+            evidence: list[dict[str, Any]] = []
             for alias in alias_terms:
                 alias_upper = alias.upper()
-                if alias_upper and alias_upper in upper_combined:
-                    score = max(score, 0.9 if alias_upper == token.upper() else 0.82)
+                if alias_upper and alias_upper in raw_upper:
+                    keyword_score = 0.9 if alias_upper == token.upper() else 0.82
+                    score = max(score, keyword_score)
                     reasons.append(f"keyword:{alias}")
+                    evidence.append({"type": "logo_or_header_ocr", "value": alias, "weight": 0.82, "confidence": keyword_score})
                 for window in generated_candidates:
                     similarity = self._similarity(alias_upper, window["text"].upper())
                     if similarity >= 84:
-                        confidence_bonus = 0.04 if window.get("source") in {"candidate", "header"} else 0.0
-                        score = max(score, 0.78 + (similarity - 84) / 100 + confidence_bonus)
-                        reasons.append(f"fuzzy:{alias}:{round(similarity, 1)}:{window.get('source')}")
-            score = max(score, self._address_phone_score(merchant, upper_combined, reasons))
-            score = max(score, self._semantic_store_score(merchant, upper_combined, reasons))
-            score = max(score, self._partial_ocr_score(merchant, generated_candidates, upper_combined, reasons))
+                        source = window.get("source")
+                        confidence_bonus = 0.04 if source == "header" else 0.0
+                        fuzzy_score = 0.70 + (similarity - 84) / 140 + confidence_bonus
+                        if source == "candidate":
+                            fuzzy_score = min(fuzzy_score, 0.68)
+                        if source in {"body", "body:pair", "body:triple"}:
+                            fuzzy_score = min(fuzzy_score, 0.78)
+                        score = max(score, fuzzy_score)
+                        reasons.append(f"fuzzy:{alias}:{round(similarity, 1)}:{source}")
+                        evidence.append({"type": "fuzzy_embedding", "value": window["text"], "weight": 0.35, "confidence": round(fuzzy_score, 3)})
+            score = max(score, self._address_phone_score(merchant, upper_combined, reasons, evidence))
+            score = max(score, self._semantic_store_score(merchant, upper_combined, reasons, evidence))
+            score = max(score, self._partial_ocr_score(merchant, generated_candidates, upper_combined, reasons, evidence))
             if score >= 0.72:
-                scored.append({
-                    "merchant": merchant,
-                    "confidence": round(min(0.99, score), 3),
-                    "reasons": reasons,
-                    "qdrantReadyText": " ".join(text_candidates[:8])[:500],
-                    "qdrantPayload": {
-                        "documentType": "receipt",
-                        "entityType": "merchant",
-                        "normalizedMerchant": merchant,
-                        "candidateText": " ".join(text_candidates[:8])[:500],
-                        "correlationReasons": reasons[:12],
-                    },
-                })
+                scored.append(self._candidate(merchant, score, reasons, evidence, text_candidates))
         scored.sort(key=lambda item: (item["confidence"], len(item["reasons"])), reverse=True)
         return scored
+
+    def _candidate(
+        self,
+        merchant: str,
+        score: float,
+        reasons: list[str],
+        evidence: list[dict[str, Any]],
+        text_candidates: list[str],
+    ) -> dict[str, Any]:
+        confidence = round(min(0.99, score), 3)
+        return {
+            "merchant": merchant,
+            "confidence": confidence,
+            "reasons": reasons,
+            "evidence": evidence,
+            "qdrantReadyText": " ".join(text_candidates[:8])[:500],
+            "qdrantPayload": {
+                "documentType": "receipt",
+                "entityType": "merchant",
+                "normalizedMerchant": merchant,
+                "candidateText": " ".join(text_candidates[:8])[:500],
+                "correlationReasons": reasons[:12],
+                "evidence": evidence[:12],
+            },
+        }
+
+    def _domain_evidence(self, upper_combined: str) -> list[tuple[str, str]]:
+        found: list[tuple[str, str]] = []
+        for match in re.finditer(r"\b(?:WWW\.)?([A-Z0-9][A-Z0-9-]{2,35})\.(COM|NET|ORG)\b", upper_combined):
+            domain = f"{match.group(1)}.{match.group(2)}"
+            merchant = self.DOMAIN_MERCHANTS.get(domain) or self.DOMAIN_MERCHANTS.get(match.group(1))
+            if merchant:
+                found.append((domain, merchant))
+        return found
+
+    def _domain_merchant_from_line(self, line: str) -> str:
+        for domain, merchant in self._domain_evidence(line.upper()):
+            return merchant
+        return ""
 
     def generate_candidates(self, raw_text: str, candidate: str = "") -> list[dict[str, Any]]:
         generated: list[dict[str, Any]] = []
@@ -382,31 +498,36 @@ class MerchantNormalizer:
             recovered.append("CVS Pharmacy")
         return recovered
 
-    def _address_phone_score(self, merchant: str, combined: str, reasons: list[str]) -> float:
+    def _address_phone_score(self, merchant: str, combined: str, reasons: list[str], evidence: list[dict[str, Any]]) -> float:
         if merchant == "CVS Pharmacy" and re.search(r"\b4140\s+ROAD\s+101\b", combined) and re.search(r"\bPLY(?:MOUTH|NQUTH)\b", combined):
             reasons.append("address:4140 ROAD 101 PLYMOUTH")
+            evidence.append({"type": "address_match", "value": "4140 ROAD 101 PLYMOUTH", "weight": 0.86, "confidence": 0.9})
             return 0.9
         if merchant == "CVS Pharmacy" and re.search(r"\b(?:478|978)[-.\s]?4612\b", combined):
             reasons.append("phone:pharmacy-store")
+            evidence.append({"type": "phone_match", "value": "478/978-4612", "weight": 0.84, "confidence": 0.84})
             return 0.84
         if merchant == "CVS Pharmacy" and re.search(r"\b4140\s+ROAD\s+101\b", combined) and any(term in combined for term in self.PHARMACY_TERMS):
             reasons.append("address:pharmacy+4140 ROAD 101")
+            evidence.append({"type": "address_match", "value": "pharmacy+4140 ROAD 101", "weight": 0.82, "confidence": 0.88})
             return 0.88
         return 0.0
 
-    def _semantic_store_score(self, merchant: str, combined: str, reasons: list[str]) -> float:
+    def _semantic_store_score(self, merchant: str, combined: str, reasons: list[str], evidence: list[dict[str, Any]]) -> float:
         if merchant == "CVS Pharmacy":
             has_cvs_like = self._similarity("CVS", combined[:160]) >= 72 or re.search(r"\bC\s*V\s*S\b|\bC[VU][S5]\b", combined)
             has_pharmacy = any(term in combined for term in self.PHARMACY_TERMS) or "PHARHACY" in combined or "PHARNACY" in combined
             if has_cvs_like and has_pharmacy:
                 reasons.append("semantic:cvs+pharmacy")
+                evidence.append({"type": "semantic_validation", "value": "cvs+pharmacy", "weight": 0.65, "confidence": 0.92})
                 return 0.92
             if has_pharmacy and "ROAD 101" in combined:
                 reasons.append("semantic:pharmacy+known_address")
+                evidence.append({"type": "semantic_validation", "value": "pharmacy+known_address", "weight": 0.62, "confidence": 0.86})
                 return 0.86
         return 0.0
 
-    def _partial_ocr_score(self, merchant: str, windows: list[dict[str, Any]], combined: str, reasons: list[str]) -> float:
+    def _partial_ocr_score(self, merchant: str, windows: list[dict[str, Any]], combined: str, reasons: list[str], evidence: list[dict[str, Any]]) -> float:
         if merchant != "CVS Pharmacy":
             return 0.0
         canonical_windows = " ".join(self._canonical(item["text"]) for item in windows[:12])
@@ -414,6 +535,7 @@ class MerchantNormalizer:
         has_store_type = any(term in canonical_windows or term in combined for term in self.PHARMACY_TERMS)
         if has_cvs_fragment and has_store_type:
             reasons.append("partial_ocr:cvs_fragment+store_type")
+            evidence.append({"type": "logo_or_header_ocr", "value": "cvs_fragment+store_type", "weight": 0.74, "confidence": 0.9})
             return 0.9
         return 0.0
 
@@ -1007,10 +1129,11 @@ class ReceiptIntelligencePipeline:
         items, facts = self.parser.parse(reconstructed)
         parser_json = parser_json or {}
         entity_fields = entity_result.get("fields", {})
-        merchant = self.merchants.normalize(
+        merchant_resolution = self.merchants.resolve(
             normalized_text or raw_text,
             str(entity_fields.get("merchant") or parser_json.get("company") or parser_json.get("storeName") or ""),
         )
+        merchant = merchant_resolution["merchant"]
         validation = self.validator.validate(items, facts, parser_json)
         confidence = self.confidence.score(reconstructed, items, validation, merchant)
         retry_plan = self.retry.plan(confidence, validation)
@@ -1028,6 +1151,7 @@ class ReceiptIntelligencePipeline:
         )
         return ParsedReceiptCandidate(
             merchant=merchant,
+            merchant_trace=merchant_resolution,
             lines=reconstructed,
             items=items,
             facts=facts,
@@ -1066,6 +1190,7 @@ class ReceiptIntelligencePipeline:
             "ocrEngine": ocr_engine or "",
             "merchant": candidate.merchant,
             "storeName": candidate.merchant,
+            "merchantConfidenceTrace": candidate.merchant_trace,
             "address": entity_fields.get("address", ""),
             "storeAddress": entity_fields.get("storeAddress", ""),
             "phone": entity_fields.get("phone", ""),

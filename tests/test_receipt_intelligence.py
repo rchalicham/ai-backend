@@ -246,3 +246,45 @@ def test_merchant_normalizer_scores_partial_cvs_pharma_with_qdrant_payload():
     assert candidates[0]["confidence"] >= 0.9
     assert "qdrantPayload" in candidates[0]
     assert candidates[0]["qdrantPayload"]["normalizedMerchant"] == "CVS Pharmacy"
+
+
+def test_domain_merchant_evidence_prevents_homegoods_overcorrection():
+    raw_text = """
+    FRESHTHYME.COM
+    VALUES YOUR FEEDBACK
+    ORGANIC BANANAS 2.49
+    TOTAL 2.49
+    """
+
+    resolution = MerchantNormalizer().resolve(raw_text)
+
+    assert resolution["merchant"] == "Fresh Thyme Market"
+    assert resolution["confidence"] >= 0.95
+    assert any(item["type"] == "domain_ocr" for item in resolution["evidence"])
+    assert resolution["merchant"] != "HomeGoods"
+
+
+def test_low_confidence_fuzzy_candidate_preserves_raw_ocr_merchant():
+    raw_text = """
+    NEIGHBORHOOD MARKET
+    VALUES YOUR FEEDBACK
+    TOTAL 8.25
+    """
+
+    resolution = MerchantNormalizer().resolve(raw_text)
+
+    assert resolution["merchant"] == "Neighborhood Market"
+    assert resolution["source"] == "raw_ocr_preserved"
+
+
+def test_hallucinated_parser_candidate_cannot_override_domain_ocr():
+    raw_text = """
+    FRESHTHYME.COM
+    ORGANIC BANANAS 2.49
+    TOTAL 2.49
+    """
+
+    resolution = MerchantNormalizer().resolve(raw_text, candidate="HOMEGOODS")
+
+    assert resolution["merchant"] == "Fresh Thyme Market"
+    assert resolution["selectedCandidate"]["merchant"] == "Fresh Thyme Market"
