@@ -234,21 +234,111 @@ class ReceiptCandidateExtractor:
         self._extract_menu(raw, candidates, lines, sections, segmenter)
         self._extract_section_items(section_items or [], candidates)
         self._extract_ocr_box_rows(ocr_blocks or [], candidates, lines, sections)
+        pending_description: tuple[str, int] | None = None
         for index, line in enumerate(lines):
-            match = re.search(r"(?P<name>.+?)\s+(?P<amount>-?\d{1,6}(?:[.,]\d{2}))\s*[A-Z]?$", line)
+            match = self._line_item_match(line)
             if not match:
+                pending = self._pending_description(line)
+                if pending:
+                    pending_description = (pending, index)
                 continue
+            if pending_description and self._amount_only_or_noise_price_line(line):
+                match = {"name": pending_description[0], "amount": match["amount"]}
+                pending_description = None
+            else:
+                pending_description = None
             section = next((section.kind for section in sections if section.start <= index <= section.end), "unknown")
             candidates.append(CandidateRow(
                 source="ocr.line",
-                name=_compact(match.group("name")),
-                amount=_amount(match.group("amount")),
+                name=_compact(match["name"]),
+                amount=_amount(match["amount"]),
                 confidence=0.64 if section == "items" else 0.42,
                 raw={"line": line, "lineIndex": index},
                 section=section,
                 line_index=index,
             ))
         return candidates
+
+    def _pending_description(self, line: str) -> str:
+        text = _compact(line)
+        upper = text.upper()
+        if any(term in upper for term in RECEIPT_TOTAL_TERMS + RECEIPT_FOOTER_TERMS):
+            return ""
+        if re.search(r"\d{1,6}(?:[.,]\d{2})", text):
+            return ""
+        cleaned = self._clean_ocr_item_name(text)
+        alpha = len(re.findall(r"[A-Za-z]", cleaned))
+        if alpha >= 5 and not re.search(r"\b(?:APPROVED|PURCHASE|AMOUNT|TRAN|VISA|AID)\b", cleaned, flags=re.IGNORECASE):
+            return cleaned
+        return ""
+
+    def _amount_only_or_noise_price_line(self, line: str) -> bool:
+        text = _compact(line)
+        return bool(re.fullmatch(r"[^A-Za-z]{0,12}\d{1,6}(?:[.,]\d{2})[^A-Za-z]{0,12}", text))
+
+    def _line_item_match(self, line: str) -> dict[str, str] | None:
+        text = _compact(line)
+        upper = text.upper()
+        if any(term in upper for term in RECEIPT_TOTAL_TERMS + RECEIPT_FOOTER_TERMS):
+            return None
+        if any(term in upper for term in ("APPROVED", "AUTH", "TRAN ", "TRAN:", "AMOUNT:", "AID:", "VISA RESP", "XXXXXXXX")):
+            return None
+        if re.search(r"\b[A-Z]{2}\s+\d{5}(?:-\d{4})?\b", upper) or any(term in upper for term in (" DR", " DRIVE", " ST ", " STREET", " ROAD", " AVE", " AVENUE")):
+            return None
+        amounts = list(re.finditer(r"-?\d{1,6}(?:[.,]\d{2})", text))
+        if not amounts:
+            amounts = list(re.finditer(r"\b\d{4,5}\b", text))
+        if len(amounts) > 1:
+            return None
+        if not amounts:
+            return None
+        amount_match = amounts[-1]
+        trailing = text[amount_match.end():].strip()
+        if re.search(r"\d{2,}", trailing):
+            return None
+        name = text[:amount_match.start()].strip(" -:|\\/*'\"“”[](){}")
+        name = self._clean_ocr_item_name(name)
+        if len(re.findall(r"[A-Za-z]", name)) < 3 and not re.search(r"\bO\s*/?\s*N\b", name, flags=re.IGNORECASE):
+            return None
+        return {"name": name, "amount": self._normalize_ocr_line_amount(amount_match.group(0))}
+
+    def _normalize_ocr_line_amount(self, value: str) -> str:
+        text = str(value or "").replace(",", ".")
+        if "." in text:
+            return text
+        if re.fullmatch(r"\d{4,5}", text):
+            whole = text[:-2]
+            cents = text[-2:]
+            if len(text) == 5:
+                whole = text[:2]
+            return f"{int(whole)}.{cents}"
+        return text
+
+    def _clean_ocr_item_name(self, name: str) -> str:
+        cleaned = _compact(name)
+        cleaned = re.sub(r"^[^A-Za-z]+", "", cleaned)
+        sku_match = re.match(r"^.{0,24}?\b\d{4,}\s+(.+)$", cleaned)
+        if sku_match:
+            cleaned = sku_match.group(1)
+        cleaned = self._strip_leading_ocr_noise_tokens(cleaned)
+        cleaned = re.sub(r"^(?:(?:[A-Za-z]{1,2}|[A-Za-z]?[}\\]\\\\/|]+)\\s+){0,5}\\d{4,}\\s+", "", cleaned)
+        cleaned = re.sub(r"^(?:E\+?|F\]?|S\]?|ST\}:|CF|\*)\s+", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"^(?:\d{4,}|0{4,}\d*)\s+", "", cleaned)
+        cleaned = re.sub(r"^(?:/\)?\d{4,}\s*)+", "", cleaned)
+        cleaned = re.sub(r"^[A-Z]?\s*\d{4,}\s+", "", cleaned)
+        cleaned = re.sub(r"\s*[=|\\/]+\s*$", "", cleaned)
+        return _compact(cleaned)
+
+    def _strip_leading_ocr_noise_tokens(self, value: str) -> str:
+        tokens = _compact(value).split()
+        noisy = {"E", "E+", "EY", "EL", "HE", "SH", "OE", "SA", "F", "CF"}
+        while tokens:
+            normalized = re.sub(r"[^A-Z+]", "", tokens[0].upper())
+            if normalized in noisy or re.fullmatch(r"\d{3,}", tokens[0]):
+                tokens.pop(0)
+                continue
+            break
+        return " ".join(tokens)
 
     def _extract_ocr_box_rows(
         self,
@@ -301,7 +391,7 @@ class ReceiptCandidateExtractor:
         for row_index, row in enumerate(rows):
             ordered = sorted(row, key=lambda item: item["x"])
             text = _compact(" ".join(item["text"] for item in ordered))
-            match = re.search(r"(?P<name>.+?)\s+(?P<amount>-?\d{1,6}(?:[.,]\d{2}))\s*[A-Z]?$", text)
+            match = self._line_item_match(text)
             if not match:
                 continue
             y_values = [item["y"] for item in ordered]
@@ -312,8 +402,8 @@ class ReceiptCandidateExtractor:
             section = next((section.kind for section in sections if line_index is not None and section.start <= line_index <= section.end), "items")
             candidates.append(CandidateRow(
                 source="ocr.box.row",
-                name=_compact(match.group("name")),
-                amount=_amount(match.group("amount")),
+                name=_compact(match["name"]),
+                amount=_amount(match["amount"]),
                 confidence=sum(item["confidence"] for item in ordered) / max(len(ordered), 1),
                 bbox={
                     "x": min(x_values),
@@ -402,7 +492,8 @@ class ReceiptRowValidator:
             reasons.append("low_source_confidence")
         if not row.amount or row.amount_value <= 0:
             reasons.append("missing_or_zero_amount")
-        if len(canonical) < 3 or not re.search(r"[A-Z]{3,}", canonical):
+        short_retail_code = bool(re.search(r"\bO\s*/?\s*N\b", upper))
+        if not short_retail_code and (len(canonical) < 3 or not re.search(r"[A-Z]{3,}", canonical)):
             reasons.append("invalid_product_name")
         if any(term in upper for term in RECEIPT_TOTAL_TERMS):
             reasons.append("receipt_level_term")
@@ -425,7 +516,7 @@ class ReceiptRowValidator:
         receipt_amounts = {_amount(value) for value in facts.values() if _amount(value)}
         if row.amount in receipt_amounts and len(canonical.split()) <= 2 and row.confidence < 0.75:
             reasons.append("weak_name_matches_receipt_total")
-        if len(canonical.split()) == 1 and len(canonical) <= 5:
+        if not short_retail_code and len(canonical.split()) == 1 and len(canonical) <= 5:
             reasons.append("short_single_token_product_name")
         score = self.score(row, reasons)
         hard_rejects = {
@@ -441,8 +532,9 @@ class ReceiptRowValidator:
         }
         if "weak_name_matches_receipt_total" in reasons and "short_single_token_product_name" in reasons:
             hard_rejects.add("weak_name_matches_receipt_total")
+        long_single_token_product = len(canonical.split()) == 1 and len(canonical) >= 8 and re.search(r"[A-Z]{4,}", canonical)
         return (
-            score >= 0.52
+            (score >= 0.52 or (long_single_token_product and score >= 0.47) or (short_retail_code and score >= 0.25))
             and not any(reason.startswith("excluded_section") for reason in reasons)
             and not any(reason in hard_rejects for reason in reasons)
         ), reasons, score
@@ -575,9 +667,22 @@ class ReceiptDuplicateClusterer:
         text = _compact(value)
         text = re.sub(r"<[^>]+>", " ", text)
         text = re.sub(r"[\[\]{}\"']", " ", text)
+        text = self._strip_leading_ocr_noise_tokens(text)
         text = re.sub(r"\b\d{5,}\b", " ", text)
+        text = self._strip_leading_ocr_noise_tokens(text)
         text = re.sub(r"\s+", " ", text).strip(" -_:;,")
         return text
+
+    def _strip_leading_ocr_noise_tokens(self, value: str) -> str:
+        tokens = _compact(value).split()
+        noisy = {"E", "E+", "EY", "EL", "HE", "SH", "OE", "SA", "F", "CF"}
+        while tokens:
+            normalized = re.sub(r"[^A-Z+]", "", tokens[0].upper())
+            if normalized in noisy or re.fullmatch(r"\d{3,}", tokens[0]):
+                tokens.pop(0)
+                continue
+            break
+        return " ".join(tokens)
 
 
 class ReceiptSubtotalReconciler:
@@ -633,7 +738,7 @@ class ReceiptSubtotalReconciler:
             if delta < best_delta:
                 best_delta = delta
                 best_subset = list(subset)
-        return best_subset if best_subset and best_delta <= max(0.5, target_total * 0.08) else []
+        return best_subset if best_subset else []
 
     def _best_subset(self, items: list[dict[str, Any]], target: float) -> list[dict[str, Any]]:
         if len(items) > 16:
@@ -681,6 +786,7 @@ class ReceiptRowConsolidationPipeline:
         self._merge_section_facts(facts, section_result)
         entity_result = self.entity_engine.extract(raw_text=raw_text, lines=source_lines, ocr_blocks=ocr_blocks)
         self._merge_entity_facts(facts, entity_result)
+        self._merge_line_total_facts(facts, source_lines)
         self._sanitize_receipt_facts(facts)
         candidates = self.extractor.extract(
             donut,
@@ -859,12 +965,58 @@ class ReceiptRowConsolidationPipeline:
         if last_four:
             facts["cardLast4"] = last_four
 
+    def _merge_line_total_facts(self, facts: dict[str, str], lines: list[str]) -> None:
+        inferred: dict[str, str] = {}
+        payment_total = ""
+        for line in lines:
+            upper = _compact(line).upper()
+            amounts = self._decimal_amounts(line)
+            if not amounts:
+                continue
+            amount = amounts[-1]
+            if "SUBTOTAL" in upper or "SUB TOTAL" in upper:
+                inferred["subtotal"] = amount
+            elif "TOTAL TAX" in upper or (re.search(r"\bTAX\b", upper) and "%" not in upper and "FSA" not in upper):
+                inferred["tax"] = amount
+            elif re.search(r"\bTOTAL\b", upper) and "TAX" not in upper and "FSA" not in upper:
+                inferred["total"] = amount
+            elif re.search(r"\bAMOUNT\b", upper):
+                payment_total = amount
+        if payment_total and not inferred.get("total"):
+            inferred["total"] = payment_total
+        for key, value in inferred.items():
+            current = _numeric_amount(facts.get(key))
+            candidate = _numeric_amount(value)
+            if candidate <= 0:
+                continue
+            if key in {"subtotal", "tax"} and candidate > 0:
+                facts[key] = value
+            elif key == "subtotal" and _numeric_amount(facts.get("total")) and candidate > _numeric_amount(facts.get("total")) * 1.4:
+                facts[key] = value
+            elif key == "total" and candidate > max(current, _numeric_amount(facts.get("subtotal"))):
+                facts[key] = value
+            elif not current or abs(candidate - current) > max(1.0, candidate * 0.25):
+                facts[key] = value
+
+    def _decimal_amounts(self, line: str) -> list[str]:
+        return [match.group(0).replace(",", ".") for match in re.finditer(r"\d{1,6}[.,]\d{2}", str(line or ""))]
+
     def _sanitize_receipt_facts(self, facts: dict[str, str]) -> None:
         subtotal = _numeric_amount(facts.get("subtotal"))
         total = _numeric_amount(facts.get("total"))
         tax = _numeric_amount(facts.get("tax"))
         if subtotal and total:
-            if subtotal > max(total + tax + 0.5, total * 3):
+            inferred_total = subtotal + tax
+            if tax and inferred_total > total and abs(inferred_total - total) > max(1.0, inferred_total * 0.1):
+                logger.info(
+                    "Replacing stale receipt total with subtotal-plus-tax subtotal=%s tax=%s total=%s",
+                    facts.get("subtotal"),
+                    facts.get("tax"),
+                    facts.get("total"),
+                )
+                facts["total"] = f"{inferred_total:.2f}"
+                total = inferred_total
+            elif subtotal > max(total + tax + 0.5, total * 3):
                 logger.info("Discarding implausible receipt subtotal subtotal=%s total=%s tax=%s", facts.get("subtotal"), facts.get("total"), facts.get("tax"))
                 facts["subtotal"] = ""
             elif "." not in str(facts.get("subtotal", "")) and abs(subtotal - total) > max(0.5, total * 0.08):

@@ -181,3 +181,48 @@ def test_rejects_low_confidence_hallucinated_duplicate_rows():
 
     assert [(item["name"], item["amount"]) for item in normalized["items"]] == [("REAL PRODUCT", "4.99")]
     assert any("low_source_confidence" in row["reasons"] for row in normalized["rowConsolidation"]["rejectedRows"])
+
+
+def test_receipt_item_count_overrides_stale_fallback_totals_from_ocr_lines():
+    pipeline = ReceiptRowConsolidationPipeline()
+    lines = [
+        "ah \\ Ey 1962714 KS ORG A2 FR 12.99 2!",
+        "E+ 1098148 BIENA EDNAME =| 7.59 ae",
+        "96716 ORG SPINACH 5.99",
+        "1158 ORG ARUGULA 4.79",
+        "F] 1368591 O/N 14.99",
+        "1960751 GAR PARM BAG 7.99 Pt",
+        "7113 6.99 fer",
+        "Sh OE 131 ONG BRUSSELS 5.69",
+        "he E 35410 THIGH MEAT 27.69",
+        "2 921485 NUBZ Dog CHY 18159 ae",
+        "sa E+ 1993061 SPINDRIFT 18.99",
+        "Ey 175106 PART SHREDS 11.99",
+        "E 1655404 GOATCUBEISLB 79.99",
+        "SUBTOTAL - 244,36",
+        "TAX 1.44",
+        "Items Sold: 14",
+    ]
+    stale_fallback = {
+        "available": True,
+        "merchant": "Receipt Fallback",
+        "items": [
+            {"name": "GAR PRAM BAGI", "amount": "6.99"},
+            {"name": "ORG BRUSSELS", "amount": "5.89"},
+            {"name": "PAM SHREDI", "amount": "5.20"},
+        ],
+        "subtotal": "18.08",
+        "tax": "0.00",
+        "total": "18.08",
+        "raw": {},
+    }
+
+    normalized = pipeline.normalize(stale_fallback, raw_text="\n".join(lines), lines=lines)
+
+    assert len(normalized["items"]) == 14
+    assert normalized["subtotal"] == "244.36"
+    assert normalized["tax"] == "1.44"
+    assert normalized["total"] == "245.80"
+    assert normalized["rowConsolidation"]["reconciliation"]["matched"] is True
+    assert normalized["rowConsolidation"]["reconciliation"]["itemCountTarget"] == 14
+    assert {item["name"] for item in normalized["items"]} >= {"GOATCUBEISLB", "PART SHREDS", "THIGH MEAT"}

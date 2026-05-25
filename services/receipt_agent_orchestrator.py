@@ -161,6 +161,7 @@ class ReceiptAgentOrchestrator:
             ocr_blocks=next_blocks,
             ocr_engine=ocr_engine or source.get("strategy") or "receipt-agent",
         )
+        semantic = self._prefer_consolidated_receipt_rows(semantic, donut_json)
         semantic = self._reconcile_merchant_confidence(semantic, parser_json=semantic_parser_json)
         semantic = self._reconcile_semantic_item_candidates(semantic)
         llama = None
@@ -270,9 +271,56 @@ class ReceiptAgentOrchestrator:
             return False
         if not donut_json.get("available"):
             return True
-        if str(donut_json.get("rawText") or "").strip() or donut_json.get("items"):
+        if str(donut_json.get("rawText") or "").strip():
             return False
         return True
+
+    def _prefer_consolidated_receipt_rows(self, semantic: dict[str, Any], donut_json: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(semantic, dict) or not isinstance(donut_json, dict):
+            return semantic
+        consolidated_items = donut_json.get("items")
+        if not isinstance(consolidated_items, list) or not consolidated_items:
+            return semantic
+        semantic_items = semantic.get("items") if isinstance(semantic.get("items"), list) else []
+        reconciliation = donut_json.get("rowConsolidation", {}).get("reconciliation", {})
+        target_count = reconciliation.get("itemCountTarget")
+        actual_count = reconciliation.get("itemCountActual")
+        count_matched = bool(target_count and actual_count == target_count and len(consolidated_items) == target_count)
+        semantic_has_receipt_level_row = any(
+            re.search(r"\b(?:TOTAL|SUBTOTAL|TAX|AMOUNT|VISA|AMEX|MASTERCARD|DISCOVER|CHANGE)\b", str(item.get("name") or ""), flags=re.IGNORECASE)
+            for item in semantic_items
+            if isinstance(item, dict)
+        )
+        materially_better_count = len(consolidated_items) >= max(len(semantic_items) + 3, len(semantic_items) * 2)
+        if not (count_matched or semantic_has_receipt_level_row or materially_better_count):
+            return semantic
+        semantic["items"] = [
+            {
+                **item,
+                "id": index + 1,
+                "confidence": round(float(item.get("confidence", item.get("weight", 0.0)) or 0.0), 3),
+            }
+            for index, item in enumerate(consolidated_items)
+            if isinstance(item, dict)
+        ]
+        for key in ("subtotal", "tax", "tip", "total", "cardUsed", "cardLast4", "paymentMethod"):
+            value = donut_json.get(key)
+            if value not in (None, ""):
+                semantic[key] = value
+        facts = semantic.setdefault("facts", {})
+        if isinstance(facts, dict):
+            for key in ("subtotal", "tax", "tip", "total", "cardUsed", "cardLast4", "paymentMethod"):
+                value = donut_json.get(key)
+                if value not in (None, ""):
+                    facts[key] = value
+        semantic.setdefault("receiptAgentPasses", {})["consolidatedRowsOverride"] = {
+            "source": "receipt_row_consolidation",
+            "reason": "consolidated_rows_match_receipt_item_count_or_outperform_semantic_items",
+            "semanticItemCount": len(semantic_items),
+            "consolidatedItemCount": len(semantic["items"]),
+            "itemCountTarget": target_count,
+        }
+        return semantic
 
     def _merge_ocr_fallback(self, raw_text: str, lines: list, ocr_blocks: list, ocr_result: dict) -> tuple[str, list, list]:
         return (
