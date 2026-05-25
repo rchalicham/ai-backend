@@ -724,6 +724,10 @@ class ReceiptRowConsolidationPipeline:
         normalized = {
             **donut,
             "merchant": merchant,
+            "date": facts.get("purchaseDate", "") or facts.get("date", ""),
+            "purchaseDate": facts.get("purchaseDate", "") or facts.get("date", ""),
+            "transactionTime": facts.get("transactionTime", ""),
+            "paymentTime": facts.get("paymentTime", ""),
             "address": facts.get("address", ""),
             "storeAddress": facts.get("storeAddress", facts.get("address", "")),
             "phone": facts.get("phone", ""),
@@ -794,6 +798,10 @@ class ReceiptRowConsolidationPipeline:
             "cardLast4": _compact(donut.get("cardLast4") or donut_card.get("last4") or parser_json.get("cardLast4") or parser_card.get("last4")),
             "approvalCode": _compact(donut.get("approvalCode") or parser_json.get("approvalCode")),
             "merchant": _compact(donut.get("merchant") or parser_json.get("company") or parser_json.get("storeName")),
+            "date": _compact(donut.get("purchaseDate") or donut.get("date") or parser_json.get("purchaseDate") or parser_json.get("date")),
+            "purchaseDate": _compact(donut.get("purchaseDate") or donut.get("date") or parser_json.get("purchaseDate") or parser_json.get("date")),
+            "transactionTime": _compact(donut.get("transactionTime") or parser_json.get("transactionTime")),
+            "paymentTime": _compact(donut.get("paymentTime") or parser_json.get("paymentTime")),
             "address": _compact(donut.get("address") or donut.get("storeAddress") or parser_json.get("address") or parser_json.get("storeAddress")),
             "storeAddress": _compact(donut.get("storeAddress") or donut.get("address") or parser_json.get("storeAddress") or parser_json.get("address")),
             "phone": _compact(donut.get("phone") or parser_json.get("phone")),
@@ -840,7 +848,7 @@ class ReceiptRowConsolidationPipeline:
 
     def _merge_entity_facts(self, facts: dict[str, str], entity_result: dict[str, Any]) -> None:
         fields = entity_result.get("fields", {}) if isinstance(entity_result, dict) else {}
-        for key in ("merchant", "address", "storeAddress", "phone", "paymentMethod", "cardUsed", "cardLast4", "approvalCode"):
+        for key in ("merchant", "date", "purchaseDate", "transactionTime", "paymentTime", "address", "storeAddress", "phone", "paymentMethod", "cardUsed", "cardLast4", "approvalCode"):
             value = _compact(fields.get(key))
             if value:
                 facts[key] = value

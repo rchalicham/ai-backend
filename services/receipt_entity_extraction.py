@@ -324,11 +324,12 @@ class HeaderEntityParser:
         patterns = (
             r"\b(\d{4}[-/]\d{1,2}[-/]\d{1,2})\b",
             r"\b(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})\b",
+            r"\b(\d{1,2}[- ](?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|SEPT|OCT|NOV|DEC)[A-Z]*\.?[- ]\d{2,4})\b",
             r"\b((?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|SEPT|OCT|NOV|DEC)[A-Z]*\.?\s+\d{1,2},?\s+\d{2,4})\b",
         )
         for line in lines[:24]:
             upper = line.text.upper()
-            if any(token in upper for token in ("RETURN POLICY", "POLICY", "THRU", "EXPIRES", "EXPIRATION", "VALID UNTIL")):
+            if any(token in upper for token in ("RETURN POLICY", "POLICY", "THRU", "EXPIRES", "EXPIRATION", "EXP. DATE", "EXP DATE", "VALID UNTIL", "COUPON", "REWARD")):
                 continue
             if self._looks_like_transaction_line(upper) and not re.search(r"\bDATE\b", upper):
                 continue
@@ -360,6 +361,16 @@ class HeaderEntityParser:
             if year < 100:
                 year += 2000
             return 1 <= day <= 31 and 1990 <= year <= 2100
+        day_month_match = re.search(
+            r"\b(\d{1,2})[- ](?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|SEPT|OCT|NOV|DEC)[A-Z]*\.?[- ](\d{2,4})\b",
+            text,
+        )
+        if day_month_match:
+            day = int(day_month_match.group(1))
+            year = int(day_month_match.group(2))
+            if year < 100:
+                year += 2000
+            return 1 <= day <= 31 and 1990 <= year <= 2100
         return False
 
     def _normalize_date_value(self, value: str) -> str:
@@ -374,6 +385,19 @@ class HeaderEntityParser:
                 if len(year) == 2:
                     year = f"20{year}"
             return f"{int(month):02d}/{int(day):02d}/{year}"
+        day_month_match = re.search(
+            r"\b(\d{1,2})[- ](JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|SEPT|OCT|NOV|DEC)[A-Z]*\.?[- ](\d{2,4})\b",
+            text,
+        )
+        if day_month_match:
+            month_lookup = {
+                "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+                "JUL": 7, "AUG": 8, "SEP": 9, "SEPT": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+            }
+            day, month_text, year = day_month_match.groups()
+            if len(year) == 2:
+                year = f"20{year}"
+            return f"{month_lookup.get(month_text[:3], 0):02d}/{int(day):02d}/{year}"
         return value
 
     def _title(self, text: str) -> str:
