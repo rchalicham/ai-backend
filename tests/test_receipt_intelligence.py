@@ -809,6 +809,7 @@ def test_retail_multiline_michaels_layout_keeps_description_not_reg_price_line()
     ]
     assert semantic["validation"]["valid"] is True
     assert semantic["validation"]["itemSum"] == "114.93"
+    assert semantic["date"] == "08/17/2024 10:44"
     assert all(not item["name"].lower().startswith(("reg", "req", "es reg")) for item in semantic["items"])
 
 
@@ -838,7 +839,24 @@ def test_retail_multiline_infers_extended_price_when_ocr_omits_final_amount():
     ]
     assert semantic["validation"]["valid"] is True
     assert semantic["validation"]["itemSum"] == "114.93"
-    assert semantic["date"] == "08/17/2024 10:44"
+
+
+def test_parser_json_rejects_payment_footer_rows_as_external_items():
+    semantic = ReceiptIntelligencePipeline().to_structured_json(
+        raw_text="",
+        lines=[],
+        parser_json={
+            "items": [
+                {"name": "vallty", "qty": "3442", "amount": "155124.00"},
+                {"name": "EXP. DATE", "qty": "1", "amount": "21.58"},
+                {"name": "INVOICE", "qty": "1", "amount": "11.00"},
+                {"name": "BEEF LIVER", "qty": "1", "amount": "4.69"},
+            ],
+            "total": "21.58",
+        },
+    )
+
+    assert [(item["name"], item["amount"]) for item in semantic["items"]] == [("BEEF LIVER", "4.69")]
 
 
 def test_pipeline_rejects_policy_header_fuzzy_totals_and_impossible_item_rows():

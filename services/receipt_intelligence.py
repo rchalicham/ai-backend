@@ -2314,11 +2314,13 @@ class ReceiptIntelligencePipeline:
                 amount = self._amount_text(raw.get("amount") or raw.get("price") or raw.get("total") or "")
                 if not name or not amount:
                     continue
+                qty = _compact_text(raw.get("qty") or raw.get("count") or raw.get("quantity") or "1") or "1"
+                if self._looks_like_non_item_parser_row(name, qty, amount):
+                    continue
                 key = f"{name.upper()}:{amount}"
                 if key in seen:
                     continue
                 seen.add(key)
-                qty = _compact_text(raw.get("qty") or raw.get("count") or raw.get("quantity") or "1") or "1"
                 items.append({
                     "name": name,
                     "qty": qty,
@@ -2328,6 +2330,24 @@ class ReceiptIntelligencePipeline:
                     "confidence": float(raw.get("confidence", raw.get("weight", 0.72)) or 0.72),
                 })
         return items
+
+    def _looks_like_non_item_parser_row(self, name: str, qty: str, amount: str) -> bool:
+        upper = _compact_text(name).upper()
+        if re.search(r"\b(?:INVOICE|EXP\.?\s*DATE|APPROVED|AUTH(?:ORIZATION)?|AID|TVR|TSI|RRN|ENTRY\s+METHOD)\b", upper):
+            return True
+        if self.tables._is_totals_or_payment_row(upper):
+            return True
+        numeric_qty = self._any_numeric(qty)
+        numeric_amount = self._any_numeric(amount)
+        if numeric_qty > 999:
+            return True
+        if numeric_amount > 10000 and not re.search(r"[A-Z]{3,}", upper):
+            return True
+        return False
+
+    def _any_numeric(self, value: Any) -> float:
+        match = re.search(r"-?\d+(?:[.,]\d+)?", str(value or ""))
+        return float(match.group(0).replace(",", ".")) if match else 0.0
 
     def _select_best_item_source(
         self,
