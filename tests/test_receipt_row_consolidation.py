@@ -259,6 +259,31 @@ def test_standalone_minus_lines_attach_as_previous_item_discounts_and_address_su
     assert all(not item["name"].endswith("-") for item in normalized["items"])
 
 
+def test_barcode_minus_lines_do_not_attach_as_item_discounts():
+    pipeline = ReceiptRowConsolidationPipeline()
+    lines = [
+        "MAPLE GROVE #648",
+        "E 1655404 GOATCUBE15LB 79.99",
+        "21064820304792605241 746 -",
+        "Items Sold: 1",
+        "SUBTOTAL 79.99",
+        "TAX 0.00",
+        "TOTAL 79.99",
+    ]
+
+    normalized = pipeline.normalize(
+        {"available": True, "merchant": "Maple Grove", "items": [], "raw": {}},
+        raw_text="\n".join(lines),
+        lines=lines,
+    )
+
+    assert len(normalized["items"]) == 1
+    assert normalized["items"][0]["name"] == "GOATCUBE15LB"
+    assert normalized["items"][0]["amount"] == "79.99"
+    assert "discount" not in normalized["items"][0]
+    assert "netAmount" not in normalized["items"][0]
+
+
 def test_fresh_thyme_department_rows_survive_legal_header_and_weighted_produce():
     pipeline = ReceiptRowConsolidationPipeline()
     lines = [

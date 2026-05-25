@@ -308,6 +308,8 @@ class ReceiptRegionClassifier:
         if any(keyword in upper for keyword in FOOTER_KEYWORDS):
             if index <= 2:
                 return "header", ["header_policy_or_footer_text"], 0.62
+            if self._is_footer_like_text_before_item_table(line, lines, index):
+                return "header", ["pre_item_footer_like_text"], 0.58
             return "footer", ["footer_keyword"], 0.82
         if self._is_near_section_keyword(upper):
             return "totals", ["total_keyword"], 0.9
@@ -318,6 +320,22 @@ class ReceiptRegionClassifier:
         if re.search(r"[A-Z]{3,}", upper) and amount_count:
             return "items", ["product_text_with_amount"], 0.66
         return "unknown", reasons or ["low_signal"], 0.45
+
+    def _is_footer_like_text_before_item_table(self, line: ReceiptLineGeometry, lines: list[ReceiptLineGeometry], index: int) -> bool:
+        page_bottom = max((candidate.y + candidate.height for candidate in lines), default=0.0)
+        if page_bottom and (line.y + line.height / 2) / page_bottom >= 0.55:
+            return False
+        lookahead = lines[index + 1: index + 18]
+        product_rows = 0
+        for candidate in lookahead:
+            upper = compact(candidate.text).upper()
+            if any(keyword in upper for keyword in TOTAL_KEYWORDS):
+                break
+            if re.search(r"[A-Z]{3,}", upper) and re.search(r"\d{1,7}(?:[.,]\d{2})", upper):
+                product_rows += 1
+            if product_rows >= 2:
+                return True
+        return False
 
     def _is_near_section_keyword(self, upper: str) -> bool:
         token = section_keyword_token(upper)

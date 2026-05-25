@@ -176,6 +176,40 @@ def test_merchant_confidence_uses_visual_spelling_when_domain_ocr_is_near_match(
     assert merchant_pass["source"] == "domain_visual_fuzzy_consensus"
 
 
+def test_merchant_confidence_rejects_noisy_centered_header_over_domain():
+    semantic = {
+        "merchant": "Freshifyme",
+        "storeName": "Freshifyme",
+        "merchantConfidenceTrace": {
+            "rawMerchant": "Freshifyme",
+            "confidence": 0.98,
+            "source": "normalized",
+            "selectedCandidate": {"merchant": "Freshifyme", "confidence": 0.98},
+        },
+        "reconstructedLines": [
+            {"index": 0, "text": "eat Ma 15 Ue SEIN", "confidence": 0.98, "bbox": {"x": 0, "y": 20, "width": 1320, "height": 37}},
+            {"index": 1, "text": "www. Freshifyme. com/Sweepstakes", "confidence": 0.82, "bbox": {"x": 575, "y": 492, "width": 268, "height": 14}},
+        ],
+        "sectionExtraction": {
+            "visualHierarchy": {
+                "lines": [
+                    {"lineIndex": 0, "visualImportance": 0.96, "zone": "merchant_zone"},
+                    {"lineIndex": 1, "visualImportance": 0.14, "zone": "item_table_zone"},
+                ]
+            }
+        },
+        "confidence": {"merchant": 0.98},
+    }
+
+    reconciled = _agent()._reconcile_merchant_confidence(semantic, parser_json={})
+
+    assert reconciled["merchant"] == "Freshifyme"
+    merchant_pass = reconciled["receiptAgentPasses"]["merchantConfidence"]
+    assert merchant_pass["confidence"] == 0.98
+    assert merchant_pass["source"] == "domain_name"
+    assert all(candidate["merchant"] != "eat Ma 15 Ue SEIN" for candidate in merchant_pass["candidates"])
+
+
 def test_merchant_confidence_penalizes_disclaimer_and_preserves_raw_ocr_when_uncertain():
     semantic = {
         "merchant": "Official Rules",

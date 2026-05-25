@@ -260,6 +260,28 @@ def test_state_machine_isolates_totals_payment_footer_from_item_parser():
     assert set(["ocr", "arithmetic", "semantic", "merchant"]).issubset(result["confidence"].keys())
 
 
+def test_pre_item_sweepstakes_url_does_not_lock_receipt_into_footer():
+    result = ReceiptSectionExtractionEngine().extract(lines=[
+        "FRESHTHYME.COM",
+        "www. Freshifyme. com/Sweepstakes",
+        "SALE",
+        "0 EGGS PSTURE RSD 6.99 NF",
+        "GROCERY",
+        "O BROWN RICE LONG GR 2.19 N F",
+        "O MARUCHAN RAMEN CHT 0.39 NF",
+        "BALANCE DUE 9.57",
+        "TOTAL TAX 0.00",
+    ])
+
+    assert [item["name"] for item in result["items"]] == [
+        "EGGS PSTURE RSD",
+        "O BROWN RICE LONG GR",
+        "O MARUCHAN RAMEN CHT",
+    ]
+    transitions = result["documentStateMachine"]["transitions"]
+    assert not any(row["to"] == "FOOTER" and row["start"] <= 1 for row in transitions)
+
+
 def test_section_engine_emits_layout_graph_and_collapses_duplicate_item_candidates():
     result = ReceiptSectionExtractionEngine().extract(lines=[
         "GENERIC MARKET",

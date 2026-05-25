@@ -563,7 +563,9 @@ class ReceiptAgentOrchestrator:
             if parser_json.get(key):
                 sources.append((str(parser_json.get(key)), None))
         for text, line_index in sources:
-            for match in re.finditer(r"\b(?:https?://)?(?:www\.)?([a-zA-Z0-9][a-zA-Z0-9-]{2,35})\.(com|net|org|io|co)\b", text):
+            normalized_text = re.sub(r"\s*\.\s*", ".", str(text or ""))
+            normalized_text = re.sub(r"\bwww\.\s+", "www.", normalized_text, flags=re.IGNORECASE)
+            for match in re.finditer(r"\b(?:https?://)?(?:www\.)?([a-zA-Z0-9][a-zA-Z0-9-]{2,35})\.(com|net|org|io|co)\b", normalized_text):
                 label = re.sub(r"[-_]+", " ", match.group(1)).strip()
                 merchant = self._merchant_from_domain_label(label)
                 if merchant:
@@ -618,11 +620,17 @@ class ReceiptAgentOrchestrator:
             if self._has_business_hint(text):
                 score += 0.08
                 reasons.append("merchant_semantic_hint")
+            quality = self._merchant_header_quality(text)
+            if quality < 0.45:
+                continue
+            score += min(0.08, quality * 0.08)
             if self._looks_like_legal_or_disclaimer(text):
                 score -= 0.42
                 reasons.append("legal_disclaimer_penalty")
             if line.get("confidence"):
                 score += min(0.08, float(line["confidence"]) * 0.08)
+            if not self._has_business_hint(text) and quality < 0.72:
+                score = min(score, 0.89)
             confidence = max(0.0, min(0.96, score))
             if confidence >= 0.62:
                 output.append({
@@ -658,6 +666,31 @@ class ReceiptAgentOrchestrator:
             and not re.search(r"\b(?:SUBTOTAL|TOTAL|TAX|BALANCE|VISA|MASTERCARD|CREDIT|DEBIT|QUANTITY|PRICE)\b", upper)
             and not re.fullmatch(r"[A-Z]{3,4}", upper)
         )
+
+    def _merchant_header_quality(self, text: str) -> float:
+        cleaned = re.sub(r"[^A-Za-z0-9 &'#.-]+", " ", str(text or ""))
+        tokens = re.findall(r"[A-Za-z][A-Za-z'&.-]*|\d+", cleaned)
+        if not tokens:
+            return 0.0
+        alpha_tokens = [token for token in tokens if re.search(r"[A-Za-z]", token)]
+        if not alpha_tokens:
+            return 0.0
+        meaningful = [token for token in alpha_tokens if len(re.sub(r"[^A-Za-z]", "", token)) >= 3]
+        short_noise = [token for token in alpha_tokens if len(re.sub(r"[^A-Za-z]", "", token)) <= 2]
+        digit_tokens = [token for token in tokens if token.isdigit()]
+        quality = 0.38
+        quality += min(0.32, len(meaningful) * 0.12)
+        if self._has_business_hint(text):
+            quality += 0.22
+        if len(meaningful) >= 1 and not digit_tokens:
+            quality += 0.12
+        if short_noise:
+            quality -= min(0.28, len(short_noise) * 0.09)
+        if digit_tokens and not self._has_business_hint(text):
+            quality -= min(0.22, len(digit_tokens) * 0.08)
+        if len(alpha_tokens) >= 3 and len(meaningful) / max(len(alpha_tokens), 1) < 0.5:
+            quality -= 0.18
+        return max(0.0, min(1.0, quality))
 
     def _has_business_hint(self, text: str) -> bool:
         return bool(re.search(r"\b(?:MARKET|MART|STORE|STORES|CENTER|CENTERS|PHARMACY|KITCHEN|RESTAURANT|CAFE|LLC|INC|CO)\b", str(text or ""), flags=re.IGNORECASE))

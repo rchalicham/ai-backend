@@ -1131,6 +1131,8 @@ class ReceiptRowConsolidationPipeline:
         if not match:
             return ""
         prefix = text[:match.start()].upper()
+        if re.search(r"\d{14,}", prefix):
+            return ""
         prefix = re.sub(r"\b\d{3,}\b", " ", prefix)
         prefix = re.sub(r"[/\\|()[\]{}<>%*#+=.,:;!?'\"]", " ", prefix)
         words = [word for word in prefix.split() if re.search(r"[A-Z]", word)]
