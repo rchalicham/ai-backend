@@ -303,13 +303,13 @@ class ReceiptAgentOrchestrator:
             for index, item in enumerate(consolidated_items)
             if isinstance(item, dict)
         ]
-        for key in ("subtotal", "tax", "tip", "total", "cardUsed", "cardLast4", "paymentMethod"):
+        for key in ("subtotal", "tax", "tip", "total", "cardUsed", "cardLast4", "paymentMethod", "address", "storeAddress", "phone"):
             value = donut_json.get(key)
             if value not in (None, ""):
                 semantic[key] = value
         facts = semantic.setdefault("facts", {})
         if isinstance(facts, dict):
-            for key in ("subtotal", "tax", "tip", "total", "cardUsed", "cardLast4", "paymentMethod"):
+            for key in ("subtotal", "tax", "tip", "total", "cardUsed", "cardLast4", "paymentMethod", "address", "storeAddress", "phone"):
                 value = donut_json.get(key)
                 if value not in (None, ""):
                     facts[key] = value

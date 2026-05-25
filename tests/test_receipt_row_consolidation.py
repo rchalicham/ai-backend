@@ -226,3 +226,33 @@ def test_receipt_item_count_overrides_stale_fallback_totals_from_ocr_lines():
     assert normalized["rowConsolidation"]["reconciliation"]["matched"] is True
     assert normalized["rowConsolidation"]["reconciliation"]["itemCountTarget"] == 14
     assert {item["name"] for item in normalized["items"]} >= {"GOATCUBEISLB", "PART SHREDS", "THIGH MEAT"}
+
+
+def test_standalone_minus_lines_attach_as_previous_item_discounts_and_address_survives():
+    pipeline = ReceiptRowConsolidationPipeline()
+    lines = [
+        "MAPLE GROVE #648",
+        "11330 FOUNTAINS DRIVE N",
+        "MAPLE GROVE MN 55369",
+        "E+ 1098148 BIENA EDMAME 7.59",
+        "2% E 0000379064 /)1898148 > 2.30-",
+        "E+ 1993061 SPINDRIFT 18.99",
+        "E 0000380456 /1953061 5.20-",
+        "Items Sold: 2",
+        "AMOUNT? $19.08",
+    ]
+
+    normalized = pipeline.normalize(
+        {"available": True, "merchant": "Maple Grove", "items": [], "raw": {}},
+        raw_text="\n".join(lines),
+        lines=lines,
+    )
+
+    items = {item["name"]: item for item in normalized["items"]}
+    assert normalized["storeAddress"] == "11330 FOUNTAINS DRIVE N, MAPLE GROVE, MN 55369"
+    assert items["BIENA EDMAME"]["amount"] == "7.59"
+    assert items["BIENA EDMAME"]["discount"] == "2.30"
+    assert items["BIENA EDMAME"]["netAmount"] == "5.29"
+    assert items["SPINDRIFT"]["discount"] == "5.20"
+    assert items["SPINDRIFT"]["netAmount"] == "13.79"
+    assert all(not item["name"].endswith("-") for item in normalized["items"])

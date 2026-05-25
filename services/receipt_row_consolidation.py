@@ -690,7 +690,7 @@ class ReceiptSubtotalReconciler:
         subtotal = _numeric_amount(facts.get("subtotal"))
         total = _numeric_amount(facts.get("total"))
         target = subtotal or total
-        item_sum = sum(_numeric_amount(item.get("amount")) for item in items)
+        item_sum = sum(self._item_amount_value(item) for item in items)
         diagnostics = {
             "itemSum": f"{item_sum:.2f}" if item_sum else "0",
             "target": f"{target:.2f}" if target else "",
@@ -704,7 +704,7 @@ class ReceiptSubtotalReconciler:
             selected_by_count = self._best_count_subset(items, diagnostics["itemCountTarget"], target)
             if selected_by_count:
                 items = selected_by_count
-                item_sum = sum(_numeric_amount(item.get("amount")) for item in items)
+                item_sum = sum(self._item_amount_value(item) for item in items)
                 diagnostics["itemSum"] = f"{item_sum:.2f}" if item_sum else "0"
                 diagnostics["itemCountActual"] = len(items)
                 diagnostics["warnings"].append("item_count_subset_reconciled")
@@ -715,7 +715,7 @@ class ReceiptSubtotalReconciler:
             return items, diagnostics
         selected = self._best_subset(items, target)
         if selected:
-            selected_sum = sum(_numeric_amount(item.get("amount")) for item in selected)
+            selected_sum = sum(self._item_amount_value(item) for item in selected)
             if abs(selected_sum - target) < abs(item_sum - target):
                 diagnostics["itemSum"] = f"{selected_sum:.2f}"
                 diagnostics["matched"] = abs(selected_sum - target) <= max(0.25, target * 0.03)
@@ -733,7 +733,7 @@ class ReceiptSubtotalReconciler:
         best_subset: list[dict[str, Any]] = []
         best_delta = float("inf")
         for subset in itertools.combinations(ranked, target_count):
-            total = sum(_numeric_amount(item.get("amount")) for item in subset)
+            total = sum(self._item_amount_value(item) for item in subset)
             delta = abs(total - target_total)
             if delta < best_delta:
                 best_delta = delta
@@ -747,12 +747,15 @@ class ReceiptSubtotalReconciler:
         best_subset: list[dict[str, Any]] = []
         for size in range(1, len(items) + 1):
             for subset in itertools.combinations(items, size):
-                total = sum(_numeric_amount(item.get("amount")) for item in subset)
+                total = sum(self._item_amount_value(item) for item in subset)
                 delta = abs(total - target)
                 if delta < best_delta:
                     best_delta = delta
                     best_subset = list(subset)
         return best_subset if best_subset and best_delta <= max(0.5, target * 0.08) else []
+
+    def _item_amount_value(self, item: dict[str, Any]) -> float:
+        return _numeric_amount(item.get("netAmount") or item.get("amount") or item.get("price"))
 
 
 class ReceiptRowConsolidationPipeline:
@@ -818,6 +821,7 @@ class ReceiptRowConsolidationPipeline:
         clusters = self.clusterer.cluster(accepted)
         duplicate_clusters = self.clusterer.duplicate_diagnostics(clusters, self.validator)
         consolidated = [self.clusterer.consolidate(cluster, self.validator, facts) for cluster in clusters]
+        self._apply_line_discounts(consolidated, source_lines)
         consolidated, reconciliation = self.reconciler.reconcile(consolidated, facts)
         consolidated = [{**item, "id": index + 1} for index, item in enumerate(consolidated)]
         merchant_resolution = self.merchants.resolve(
@@ -958,6 +962,17 @@ class ReceiptRowConsolidationPipeline:
             value = _compact(fields.get(key))
             if value:
                 facts[key] = value
+        header = entity_result.get("header", {}) if isinstance(entity_result, dict) else {}
+        address_candidate = header.get("address", {}) if isinstance(header, dict) else {}
+        if isinstance(address_candidate, dict) and not facts.get("address"):
+            try:
+                confidence = float(address_candidate.get("confidence") or 0)
+            except (TypeError, ValueError):
+                confidence = 0.0
+            value = _compact(address_candidate.get("value"))
+            if value and confidence >= 0.68:
+                facts["address"] = value
+                facts["storeAddress"] = value
         card_type = _compact(fields.get("cardType"))
         if card_type:
             facts["cardUsed"] = card_type
@@ -1022,6 +1037,70 @@ class ReceiptRowConsolidationPipeline:
             elif "." not in str(facts.get("subtotal", "")) and abs(subtotal - total) > max(0.5, total * 0.08):
                 logger.info("Discarding no-cents subtotal that disagrees with total subtotal=%s total=%s", facts.get("subtotal"), facts.get("total"))
                 facts["subtotal"] = ""
+
+    def _apply_line_discounts(self, items: list[dict[str, Any]], lines: list[str]) -> None:
+        if not items or not lines:
+            return
+        line_items: list[tuple[int, dict[str, Any]]] = []
+        for item in items:
+            trace = item.get("rowConfidenceTrace", {}) if isinstance(item, dict) else {}
+            selected = trace.get("selected", {}) if isinstance(trace, dict) else {}
+            line_index = selected.get("lineIndex")
+            if isinstance(line_index, int):
+                line_items.append((line_index, item))
+        if not line_items:
+            return
+        line_items.sort(key=lambda entry: entry[0])
+        for index, line in enumerate(lines):
+            discount = self._standalone_discount_amount(line)
+            if not discount:
+                continue
+            target = None
+            for line_index, item in line_items:
+                if line_index < index:
+                    target = item
+                else:
+                    break
+            if target is None:
+                continue
+            discount_value = _numeric_amount(discount)
+            gross_value = _numeric_amount(target.get("amount") or target.get("price"))
+            if discount_value <= 0 or gross_value <= 0:
+                continue
+            existing_discount = _numeric_amount(target.get("discount"))
+            total_discount = existing_discount + discount_value
+            target["grossAmount"] = f"{gross_value:.2f}"
+            target["discount"] = f"{total_discount:.2f}"
+            target["netAmount"] = f"{max(0.0, gross_value - total_discount):.2f}"
+            adjustments = target.setdefault("adjustments", [])
+            if isinstance(adjustments, list):
+                adjustments.append({
+                    "type": "discount",
+                    "amount": f"{discount_value:.2f}",
+                    "rawLine": line,
+                    "lineIndex": index,
+                    "appliesTo": "previous_item_line",
+                })
+
+    def _standalone_discount_amount(self, line: str) -> str:
+        text = _compact(line)
+        upper = text.upper()
+        if not text or any(term in upper for term in RECEIPT_TOTAL_TERMS + RECEIPT_FOOTER_TERMS):
+            return ""
+        match = re.search(r"(?P<amount>\d{1,5}(?:[.,]\d{2})|\d{3,5})\s*[-–—]\s*$", text)
+        if not match:
+            return ""
+        prefix = text[:match.start()].upper()
+        prefix = re.sub(r"\b\d{3,}\b", " ", prefix)
+        prefix = re.sub(r"[/\\|()[\]{}<>%*#+=.,:;!?'\"]", " ", prefix)
+        words = [word for word in prefix.split() if re.search(r"[A-Z]", word)]
+        product_words = [
+            word for word in words
+            if word not in {"E", "EJ", "EL", "EY", "F", "CF", "OE", "SA", "ST", "X"}
+        ]
+        if product_words:
+            return ""
+        return match.group("amount").replace(",", ".")
 
     def _section_boundary_lock(self, section_result: dict[str, Any]) -> dict[str, Any]:
         debug = section_result.get("debug", {}) if isinstance(section_result, dict) else {}
