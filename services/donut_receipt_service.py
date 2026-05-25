@@ -115,7 +115,15 @@ class DonutReceiptService:
             await self._ensure_loaded()
             loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(None, self._infer_sync, isolated_image_bytes)
+            logo_candidates = await loop.run_in_executor(None, self._logo_header_candidates, isolated_image_bytes)
             result["receiptIsolation"] = isolation.diagnostics
+            result["logoCandidates"] = logo_candidates
+            result["visualIdentity"] = {
+                "schemaVersion": "receipt-visual-identity-v1",
+                "strategy": "isolated_receipt_header_logo_crop",
+                "candidateCount": len(logo_candidates),
+                "candidates": logo_candidates,
+            }
             return result
 
     async def _ensure_loaded(self) -> None:
@@ -182,6 +190,105 @@ class DonutReceiptService:
             confidence=self._score(parsed),
             raw=parsed,
         ).to_dict()
+
+    def _logo_header_candidates(self, image_bytes: bytes) -> list[dict[str, Any]]:
+        crops = self._logo_header_crops(image_bytes)
+        candidates: list[dict[str, Any]] = []
+        normalizer = self.row_consolidation.merchants
+        for crop in crops:
+            try:
+                result = self._infer_sync(crop["imageBytes"])
+            except Exception:
+                continue
+            merchant = str(result.get("merchant") or "").strip()
+            if not merchant:
+                continue
+            if not normalizer._looks_like_header_merchant(merchant):
+                continue
+            if normalizer._looks_like_generic_business_fragment(merchant):
+                continue
+            confidence = max(0.62, min(0.9, float(result.get("confidence") or 0.0) + 0.1))
+            candidates.append({
+                "merchant": merchant,
+                "confidence": round(confidence, 3),
+                "source": "logo_header_crop",
+                "crop": crop["crop"],
+                "model": result.get("model", self.model_name),
+                "evidence": [
+                    {
+                        "type": "visual_logo_crop",
+                        "value": merchant,
+                        "confidence": round(confidence, 3),
+                        "bbox": crop["crop"],
+                    }
+                ],
+            })
+        return self._dedupe_logo_candidates(candidates)
+
+    def _logo_header_crops(self, image_bytes: bytes) -> list[dict[str, Any]]:
+        try:
+            import cv2
+            import numpy as np
+        except Exception:
+            return []
+        try:
+            image = self.image_isolation._decode(cv2, np, image_bytes)
+        except Exception:
+            return []
+        height, width = image.shape[:2]
+        if height <= 0 or width <= 0:
+            return []
+        crop_specs = [
+            {"x": 0.0, "y": 0.0, "width": 1.0, "height": 0.28, "name": "top_full"},
+            {"x": 0.0, "y": 0.0, "width": 1.0, "height": 0.4, "name": "top_header"},
+            {"x": 0.05, "y": 0.0, "width": 0.9, "height": 0.25, "name": "top_center"},
+        ]
+        crops: list[dict[str, Any]] = []
+        for spec in crop_specs:
+            left = max(0, int(width * spec["x"]))
+            top = max(0, int(height * spec["y"]))
+            right = min(width, int(width * (spec["x"] + spec["width"])))
+            bottom = min(height, int(height * (spec["y"] + spec["height"])))
+            if right - left < 20 or bottom - top < 20:
+                continue
+            crop = image[top:bottom, left:right]
+            crop = self._prepare_logo_crop(cv2, crop)
+            try:
+                crops.append({
+                    "imageBytes": self.image_isolation._encode(cv2, crop),
+                    "crop": {
+                        "name": spec["name"],
+                        "x": round(left / width, 4),
+                        "y": round(top / height, 4),
+                        "width": round((right - left) / width, 4),
+                        "height": round((bottom - top) / height, 4),
+                    },
+                })
+            except Exception:
+                continue
+        return crops
+
+    def _prepare_logo_crop(self, cv2: Any, crop: Any) -> Any:
+        height, width = crop.shape[:2]
+        scale = 2.0 if max(height, width) < 900 else 1.4
+        enlarged = cv2.resize(crop, (max(1, int(width * scale)), max(1, int(height * scale))), interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(enlarged, cv2.COLOR_BGR2GRAY)
+        background = cv2.medianBlur(gray, 21)
+        flattened = cv2.divide(gray, background, scale=255)
+        clahe = cv2.createCLAHE(clipLimit=2.6, tileGridSize=(8, 8))
+        contrasted = clahe.apply(flattened)
+        return cv2.cvtColor(contrasted, cv2.COLOR_GRAY2BGR)
+
+    def _dedupe_logo_candidates(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        output: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for candidate in sorted(candidates, key=lambda item: float(item.get("confidence") or 0.0), reverse=True):
+            key = re.sub(r"[^A-Z0-9]+", "", str(candidate.get("merchant") or "").upper())
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            output.append(candidate)
+        return output[:5]
 
     def _parse_donut_sequence(self, sequence: str) -> dict[str, Any]:
         try:

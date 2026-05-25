@@ -96,3 +96,55 @@ class QdrantService:
             }
             for result in results
         ]
+
+    def upsert_receipt_pattern_payloads(
+        self,
+        payloads: List[dict],
+        vectors: List[List[float]],
+        collection_name: str = "receipt_document_patterns",
+    ) -> int:
+        if not payloads or not vectors:
+            return 0
+        original_collection = self.collection_name
+        self.collection_name = collection_name
+        try:
+            self.ensure_collection(vector_size=len(vectors[0]))
+            points = []
+            for payload, vector in zip(payloads, vectors):
+                point_id = payload.get("id") or str(uuid.uuid5(uuid.NAMESPACE_URL, str(payload)))
+                points.append(
+                    PointStruct(
+                        id=point_id,
+                        vector=vector,
+                        payload={
+                            "document_type": "receipt",
+                            "text": payload.get("text", ""),
+                            **(payload.get("metadata") or {}),
+                        },
+                    )
+                )
+            if points:
+                self.client.upsert(collection_name=collection_name, points=points)
+            return len(points)
+        finally:
+            self.collection_name = original_collection
+
+    def search_receipt_patterns(
+        self,
+        query_vector: List[float],
+        top_k: int = 8,
+        collection_name: str = "receipt_document_patterns",
+    ) -> List[dict]:
+        results = self.client.search(
+            collection_name=collection_name,
+            query_vector=query_vector,
+            limit=top_k,
+        )
+        return [
+            {
+                "id": result.id,
+                "score": result.score,
+                **(result.payload or {}),
+            }
+            for result in results
+        ]

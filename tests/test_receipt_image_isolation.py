@@ -27,6 +27,9 @@ def test_receipt_image_isolation_warps_largest_receipt_region_and_reports_debug_
     output = cv2.imdecode(np.frombuffer(result.image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
 
     assert result.diagnostics["applied"] is True
+    assert result.diagnostics["ocrInputPolicy"] == "raw_image_never_forwarded"
+    assert result.diagnostics["receiptIsolated"] is True
+    assert result.diagnostics["backgroundRemoved"] is True
     assert result.diagnostics["selectedContour"]["areaRatio"] > 0.25
     assert output.shape[0] > output.shape[1]
     assert output.mean() > 120

@@ -44,6 +44,16 @@ class LLMService:
         )
         reconstructed_lines = [line.text for line in intelligence.lines]
         normalized_raw_text = "\n".join(reconstructed_lines) or raw_text
+        structured_document_graph = {
+            "layout": intelligence.layout_json,
+            "sectionExtraction": getattr(intelligence, "section_extraction", {}),
+            "documentStateMachine": getattr(intelligence, "section_extraction", {}).get("documentStateMachine", {}),
+            "documentOntology": getattr(intelligence, "ontology", {}),
+            "entityGraph": intelligence.graph,
+            "semanticBlocks": [block.to_dict() for block in intelligence.semantic_blocks],
+            "tables": intelligence.tables,
+            "reconstructedRows": reconstructed_lines,
+        }
         parser_hint = {
             **(parser_json or {}),
             "company": intelligence.merchant or (parser_json or {}).get("company", ""),
@@ -64,6 +74,9 @@ class LLMService:
                 "warnings": intelligence.warnings,
                 "retryPlan": intelligence.retry_plan,
                 "layoutQuality": intelligence.layout_json.get("quality", {}),
+                "sectionExtraction": getattr(intelligence, "section_extraction", {}),
+                "documentStateMachine": getattr(intelligence, "section_extraction", {}).get("documentStateMachine", {}),
+                "documentOntology": getattr(intelligence, "ontology", {}),
             },
         }
         schema = {
@@ -104,16 +117,19 @@ class LLMService:
                     "content": (
                         "You convert OCR receipt text into a strict JSON receipt schema. "
                         "Return ONLY valid JSON. No markdown, no commentary. "
-                        "Use the structured receipt layout JSON as the primary reasoning input, then verify against OCR text. "
-                        "Flat OCR text is fallback evidence, not the preferred structure. The parser JSON is a hint. "
+                        "Use the structured receipt document graph as the primary and authoritative reasoning input. "
+                        "Do not reconstruct the receipt from a flat OCR blob. The parser JSON is a hint. "
                         "Return purchased items plus receipt-level merchant/store name, store address, purchase date, card brand, card last digits, subtotal, tax, tip, and total. "
                         "Subtotal, tax, tip, total, purchase date, address, and company name are one-time receipt-level fields, never item fields. "
                         "Do not convert every OCR line into an item. Reason across adjacent OCR lines: item names are often on one line and prices on the next line; "
                         "product codes, E/N tax markers, discounts, and quantities may appear between them. Combine those lines into one item only when there is a real product name and a matching item amount. "
                         "Prefer rows from the items table and semantic item blocks over duplicated footer/header OCR fragments. "
+                        "Use tableGraph, financialReconciliation, taxRelationship, and arithmetic diagnostics before trusting any flat OCR total line. "
                         "Keep real purchased item rows only. Exclude store address, member number, payment card lines, approvals, item count summaries, "
                         "subtotal/tax/total/change lines, terminal metadata, savings summary, footer text, numeric-only rows, and product-code-only rows from items. "
                         "When OCR candidates disagree, prefer the candidate with clearer item names, prices, subtotal, tax, and total. "
+                        "If tax equals total or subtotal + tax + tip does not equal total, treat the tax OCR mapping as suspect and use the arithmetic-consistent tax when supported. "
+                        "Collapse duplicate item OCR variants when the name and quantity match and the prices are nearly equal; keep diagnostics instead of returning both as purchased items. "
                         "Amounts must be numeric strings without currency symbols. "
                         "Do not invent values not supported by OCR text."
                     ),
@@ -123,8 +139,7 @@ class LLMService:
                     "content": (
                         f"Required JSON schema:\n{json.dumps(schema, ensure_ascii=True)}\n\n"
                         f"OCR engine: {ocr_engine or ''}\n"
-                        f"Structured receipt layout JSON:\n{json.dumps(intelligence.layout_json, ensure_ascii=True)}\n\n"
-                        f"Reconstructed receipt rows:\n{json.dumps(reconstructed_lines, ensure_ascii=True)}\n\n"
+                        f"Structured receipt document graph:\n{json.dumps(structured_document_graph, ensure_ascii=True)}\n\n"
                         f"Line-by-line OCR text:\n{json.dumps(lines or [], ensure_ascii=True)}\n\n"
                         f"Alternate OCR candidates:\n{json.dumps(self._compact_ocr_variants(ocr_variants or []), ensure_ascii=True)}\n\n"
                         f"Parser candidate JSON:\n{json.dumps(parser_hint, ensure_ascii=True)}\n\n"
@@ -133,9 +148,12 @@ class LLMService:
                         "- A product-code row such as 331222 or 1462714 is not an item.\n"
                         "- E/N marker rows are not items.\n"
                         "- Payment, approval, subtotal, tax, total, change, savings, and footer rows are not items.\n"
+                        "- If subtotal and total are present, tax must satisfy subtotal + tax + tip = total unless the value is unresolved.\n"
+                        "- If OCR maps Tax to the same amount as Total, reject that tax candidate and use total - subtotal - tip when arithmetic is exact.\n"
+                        "- Same item name + same quantity + near-equal amount is one OCR-variant cluster, not multiple purchased items.\n"
                         "- For each item return name, count/qty, amount/price, and weight only.\n"
-                        "- Put address, company, purchase date, tax, subtotal, total, tip, card brand, and last 4 digits only at receipt level.\n\n"
-                        f"Flat OCR text:\n{normalized_raw_text[:16000]}"
+                        "- Put address, company, purchase date, tax, subtotal, total, tip, card brand, and last 4 digits only at receipt level.\n"
+                        "- Keep low-confidence merchant, address, date, and card-last-four values empty instead of inventing corrections."
                     ),
                 },
             ],
@@ -176,9 +194,17 @@ class LLMService:
         )
 
     def _finalize_receipt_intelligence(self, structured: dict[str, Any], intelligence: Any) -> dict[str, Any]:
+        merchant_trace = getattr(intelligence, "merchant_trace", {}) or {}
         if intelligence.merchant and not structured.get("company"):
             structured["company"] = intelligence.merchant
             structured["storeName"] = intelligence.merchant
+        elif structured.get("company") and intelligence.merchant:
+            structured["company"] = intelligence.merchant
+            structured["storeName"] = intelligence.merchant
+        elif structured.get("company") and not self._value_supported_by_ocr(structured.get("company", ""), getattr(intelligence, "lines", [])):
+            structured["company"] = ""
+            structured["storeName"] = ""
+            structured["merchantUnresolved"] = True
         intelligence_items = self._normalize_intelligence_items(getattr(intelligence, "items", []))
         if intelligence_items:
             if not structured.get("items"):
@@ -187,6 +213,7 @@ class LLMService:
                 structured["items"] = self._prefer_reconciled_intelligence_items(structured, intelligence_items)
         validation = self.receipt_intelligence.validator.validate(structured.get("items", []), intelligence.facts, structured)
         confidence = self.receipt_intelligence.confidence.score(intelligence.lines, structured.get("items", []), validation, structured.get("company", ""))
+        confidence["merchant"] = round(float(merchant_trace.get("confidence") or 0.0), 3)
         retry_plan = self.receipt_intelligence.retry.plan(confidence, validation)
         structured["receiptIntelligence"] = {
             "version": "2026.05",
@@ -197,8 +224,17 @@ class LLMService:
             "semanticBlocks": [block.to_dict() for block in intelligence.semantic_blocks],
             "tables": intelligence.tables,
             "graph": intelligence.graph,
+            "sectionExtraction": getattr(intelligence, "section_extraction", {}),
+            "documentStateMachine": getattr(intelligence, "section_extraction", {}).get("documentStateMachine", {}),
+            "documentOntology": getattr(intelligence, "ontology", {}),
             "validation": validation,
             "confidence": confidence,
+            "confidenceTrace": {
+                "merchant": merchant_trace,
+                "sections": getattr(intelligence, "section_extraction", {}).get("confidence", {}),
+                "ontology": getattr(intelligence, "ontology", {}).get("confidence", {}),
+                "arithmetic": getattr(intelligence, "section_extraction", {}).get("validation", {}).get("arithmeticChecks", []),
+            },
             "retryPlan": retry_plan,
             "warnings": validation.get("warnings", []),
         }
@@ -237,6 +273,13 @@ class LLMService:
         intelligence_delta = abs(self._sum_receipt_items(intelligence_items) - target)
         if intelligence_delta + 0.01 < structured_delta:
             return [{**item, "id": index + 1} for index, item in enumerate(intelligence_items)]
+        if (
+            len(structured_items) == 1
+            and len(intelligence_items) > 1
+            and intelligence_delta <= 0.01
+            and abs(self._numeric_amount((structured_items[0] or {}).get("amount") or (structured_items[0] or {}).get("price")) - target) <= 0.01
+        ):
+            return [{**item, "id": index + 1} for index, item in enumerate(intelligence_items)]
         return structured_items
 
     def _sum_receipt_items(self, items: list[dict[str, Any]]) -> float:
@@ -249,6 +292,19 @@ class LLMService:
         if subtotal > 0 and (not total or subtotal <= max(total + tax + 0.5, total * 3)):
             return subtotal
         return total
+
+    def _value_supported_by_ocr(self, value: str, lines: list[Any]) -> bool:
+        key = re.sub(r"[^A-Z0-9]+", "", str(value or "").upper())
+        if not key:
+            return False
+        if len(key) <= 3:
+            return False
+        for line in lines or []:
+            text = getattr(line, "text", line)
+            line_key = re.sub(r"[^A-Z0-9]+", "", str(text or "").upper())
+            if key and (key in line_key or line_key in key):
+                return True
+        return False
 
     def _compact_ocr_variants(self, variants: list[dict[str, Any]]) -> list[dict[str, Any]]:
         compacted = []

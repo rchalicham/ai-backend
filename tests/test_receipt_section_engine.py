@@ -77,6 +77,96 @@ def test_section_engine_groups_ocr_boxes_by_y_position_and_alignment():
     assert result["payment"]["fields"]["approvalCode"] == "A1B2C3"
 
 
+def test_totals_parser_extracts_tax_rate_amount_relationship_without_cross_mapping():
+    result = ReceiptSectionExtractionEngine().extract(lines=[
+        "GENERIC STORE",
+        "LARGE ITEM 912.16",
+        "SUBTOTAL 912.16",
+        "Sales Tax 7.525% 68.64",
+        "TOTAL 980.80",
+    ])
+
+    assert result["totals"]["fields"]["tax"] == "68.64"
+    assert result["totals"]["fields"]["taxPercent"] == "7.525"
+    assert result["totals"]["fields"]["taxAmount"] == "68.64"
+    assert result["totals"]["taxRelationship"]["valid"] is True
+    assert result["debug"]["taxRelationshipDiagnostics"]
+
+
+def test_section_engine_reconstructs_space_separated_cents_and_does_not_use_subtotal_as_item_price():
+    result = ReceiptSectionExtractionEngine().extract(lines=[
+        "KADAI INDIAN KITCHEN",
+        "29-Jun-2023 4:43:01P",
+        "3 Custom Item $390 00",
+        "2 Custom Item $130.00",
+        "1 Custom Item $120 00",
+        "50 Custom Item $62.50",
+        "30 Butter Naan $89.70",
+        "30 Garlic Naan $120 00",
+        "Subtotal $912.20",
+        "Sales Tax 7.525% $68 64",
+        "Total $980.84",
+        "AMEX 8007",
+        "30 Garlic Naan",
+        "Subtotal",
+        "$912.20",
+    ])
+
+    assert sorted((item["name"], item["amount"]) for item in result["items"]) == sorted([
+        ("Custom Item", "390.00"),
+        ("Custom Item", "130.00"),
+        ("Custom Item", "120.00"),
+        ("Custom Item", "62.50"),
+        ("Butter Naan", "89.70"),
+        ("Garlic Naan", "120.00"),
+    ])
+    assert result["totals"]["fields"]["tax"] == "68.64"
+    assert result["financialReconciliation"]["selectedSum"] == "912.20"
+    assert all(item["amount"] != "912.20" for item in result["items"])
+
+
+def test_totals_parser_rejects_tax_equal_to_total_and_infers_arithmetic_tax():
+    result = ReceiptSectionExtractionEngine().extract(lines=[
+        "GENERIC STORE",
+        "Custom Item",
+        "1",
+        "$120.00",
+        "Sub Total",
+        "$912.20",
+        "Tax",
+        "$980.84",
+        "Tip",
+        "$0",
+        "Total",
+        "$980.84",
+    ])
+
+    assert result["totals"]["fields"]["tax"] == "68.64"
+    assert result["totals"]["fields"]["taxAmount"] == "68.64"
+    assert result["totals"]["taxRelationship"]["inferredFromArithmetic"] is True
+    assert result["totals"]["taxRelationship"]["rejectedTaxCandidate"] == "980.84"
+
+
+def test_section_engine_emits_financial_table_graph_for_reconstructed_rows():
+    result = ReceiptSectionExtractionEngine().extract(lines=[
+        "GENERIC STORE",
+        "2 EA MULCH BAG 7.00",
+        "WASHERS 3 @ 1.25 3.75",
+        "SUBTOTAL 10.75",
+        "TAX 0.86",
+        "TOTAL 11.61",
+    ])
+
+    table_graph = result["tableGraph"]
+    assert table_graph["schemaVersion"] == "receipt-table-graph-v1"
+    assert [(row["quantity"], row["description"], row["unitPrice"], row["extendedPrice"]) for row in table_graph["rows"]] == [
+        ("2", "MULCH BAG", "3.50", "7.00"),
+        ("3", "WASHERS", "1.25", "3.75"),
+    ]
+    assert any(edge["type"] == "HAS_EXTENDEDPRICE" for edge in table_graph["edges"])
+    assert result["debug"]["rowReconstructionVisualization"]
+
+
 def test_row_consolidation_uses_section_fields_and_section_item_candidates():
     pipeline = ReceiptRowConsolidationPipeline()
     normalized = pipeline.normalize(
@@ -145,3 +235,117 @@ def test_item_parser_rejects_mutated_totals_payment_and_survey_rows():
     debug_rejections = normalized["sectionExtraction"]["debug"]["rejectedItemRows"]
     assert any("locked_non_item_region" in row["reason"] for row in debug_rejections)
     assert any("survey_or_barcode" in row["reason"] for row in debug_rejections)
+
+
+def test_state_machine_isolates_totals_payment_footer_from_item_parser():
+    result = ReceiptSectionExtractionEngine().extract(lines=[
+        "GENERIC MARKET",
+        "APPLES 3.25",
+        "USD 3.25",
+        "BALANCE DUE 3.25",
+        "VISA ************2222",
+        "THANK YOU",
+        "BANANAS 1.00",
+    ])
+
+    assert [item["name"] for item in result["items"]] == ["APPLES"]
+    assert result["documentStateMachine"]["states"] == ["HEADER", "ITEMS", "TOTALS", "PAYMENT", "FOOTER"]
+    assert result["parserIsolation"]["itemsParserActiveOnlyIn"] == ["ITEMS"]
+    rejected = result["debug"]["rejectedItemRows"]
+    assert any(row["line"] == "USD 3.25" and "locked_non_item_region" in row["reason"] for row in rejected)
+    assert any(row["line"] == "BALANCE DUE 3.25" and "locked_non_item_region" in row["reason"] for row in rejected)
+    assert any(row["line"] == "BANANAS 1.00" and "after_item_region_boundary" in row["reason"] for row in rejected)
+    assert result["debug"]["regionOverlays"]
+    assert result["debug"]["arithmeticValidationLogs"]
+    assert set(["ocr", "arithmetic", "semantic", "merchant"]).issubset(result["confidence"].keys())
+
+
+def test_section_engine_emits_layout_graph_and_collapses_duplicate_item_candidates():
+    result = ReceiptSectionExtractionEngine().extract(lines=[
+        "GENERIC MARKET",
+        "MLR BNLS BRST 13.90",
+        "MLR BNLS BRSI 13.90",
+        "TOTAL 13.90",
+        "VISA ************4444",
+    ])
+
+    assert [(item["name"], item["amount"]) for item in result["items"]] == [("MLR BNLS BRST", "13.90")]
+    assert result["layoutGraph"]["schemaVersion"] == "receipt-layout-graph-v1"
+    assert any(node["type"] == "ITEMS" for node in result["layoutGraph"]["nodes"])
+    assert any(edge["type"] == "NEXT_REGION" for edge in result["layoutGraph"]["edges"])
+    rejected = result["debug"]["rejectedItemRows"]
+    assert any(row["reason"] == "duplicate_item_candidate_suppressed" for row in rejected)
+    assert result["debug"]["duplicateSuppressionDiagnostics"]
+
+
+def test_item_cardinality_and_financial_solver_select_consistent_subset():
+    result = ReceiptSectionExtractionEngine().extract(lines=[
+        "GENERIC MARKET",
+        "BEEF LIVER 4.69",
+        "MLR BNLS BRS! 43.90",
+        "ORG RED BEETS 2.99",
+        "MLR BNLS BRSI 13.90",
+        "jot yspgn 2.58",
+        "Total number of items sold 3",
+        "TOTAL 21.58",
+        "VISA",
+    ])
+
+    assert [(item["name"], item["amount"]) for item in result["items"]] == [
+        ("BEEF LIVER", "4.69"),
+        ("ORG RED BEETS", "2.99"),
+        ("MLR BNLS BRSI", "13.90"),
+    ]
+    assert result["itemCardinality"]["count"] == 3
+    assert result["financialReconciliation"]["selectedCount"] == 3
+    assert result["financialReconciliation"]["selectedSum"] == "21.58"
+    assert result["itemCandidateGraph"]["schemaVersion"] == "receipt-item-candidate-graph-v1"
+    rejected = result["debug"]["rejectedItemRows"]
+    assert any(row["line"] == "jot yspgn" and row["reason"] == "global_financial_reconciliation_rejected" for row in rejected)
+
+
+def test_split_ocr_rows_use_cardinality_and_total_to_reject_payment_footer_noise():
+    result = ReceiptSectionExtractionEngine().extract(lines=[
+        "Wow. FI Eshi Hye - Com/Sweepst Akes",
+        "45760 WIUL AVENUE N, PLYMOULL, MN 59447",
+        "Quantity",
+        "Price",
+        "BEEF LIVER",
+        "1",
+        "$4.69",
+        "~ MLR BNLS BRS!",
+        "1",
+        "$43.90",
+        "PROT RO RED BEETS ii",
+        "1",
+        "$2.99",
+        "BAI ANCE DUE",
+        "1",
+        "$21.58",
+        "MLR BNLS BRSI",
+        "1",
+        "$13.90",
+        "USD",
+        "1",
+        "$21.58",
+        "POO BNLS BRST",
+        "1",
+        "$43.90",
+        "jot yspgn",
+        "1",
+        "$2.58",
+        "Total number of items sold 3",
+        "VISA",
+    ])
+
+    assert [(item["name"], item["amount"]) for item in result["items"]] == [
+        ("BEEF LIVER", "4.69"),
+        ("PROT RO RED BEETS ii", "2.99"),
+        ("MLR BNLS BRSI", "13.90"),
+    ]
+    assert result["totals"]["fields"]["total"] == "21.58"
+    assert result["itemCardinality"]["count"] == 3
+    assert result["financialReconciliation"]["selectedCount"] == 3
+    assert result["financialReconciliation"]["selectedSum"] == "21.58"
+    rejected = result["debug"]["rejectedItemRows"]
+    assert any(row["line"] == "jot yspgn" and row["reason"] == "global_financial_reconciliation_rejected" for row in rejected)

@@ -5,6 +5,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from services.receipt_visual_hierarchy import LEGAL_DISCLAIMER_TERMS, ReceiptVisualHierarchyEngine
+
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +26,10 @@ STREET_TERMS = (
 )
 HEADER_SKIP_TERMS = (
     "REG", "TRN", "CSHR", "STR", "STORE", "RECEIPT", "TOTAL", "SUBTOTAL",
-    "TAX", "VISA", "MASTERCARD", "AUTH", "APPROVAL", "CARD",
+    "TAX", "VISA", "MASTERCARD", "AUTH", "APPROVAL", "CARD", "SURVEY",
+    "FEEDBACK", "RETURN POLICY", "NO PURCHASE", "NO PURCHASE NECESSARY",
+    "VOID WHERE PROHIBITED", "PROHIBITED", "SWEEPSTAKES", "SWEEPST", "OFFICIAL RULES", "RULES",
+    "QUANTITY", "PRICE",
 )
 US_STATE_CODES = {
     "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "IA", "ID", "IL",
@@ -147,23 +152,73 @@ class EntityGeometryBuilder:
 
 
 class HeaderEntityParser:
+    def __init__(self) -> None:
+        self.visual_hierarchy = ReceiptVisualHierarchyEngine()
+
     def parse(self, lines: list[EntityLine]) -> dict[str, Any]:
-        merchant = self._merchant(lines)
+        visual_hierarchy = self.visual_hierarchy.analyze(lines)
+        merchant = self._merchant(lines, visual_hierarchy)
         address = self._address(lines)
         phone = self._phone(lines)
+        date = self._date(lines)
         return {
             "merchant": merchant.to_dict() if merchant else {},
             "address": address.to_dict() if address else {},
             "phone": phone.to_dict() if phone else {},
+            "date": date.to_dict() if date else {},
+            "visualHierarchy": visual_hierarchy,
         }
 
-    def _merchant(self, lines: list[EntityLine]) -> EntityCandidate | None:
+    def _merchant(self, lines: list[EntityLine], visual_hierarchy: dict[str, Any]) -> EntityCandidate | None:
         header = lines[:8]
-        for line in header[:5]:
+        saliency_by_index = {
+            int(row.get("lineIndex")): row
+            for row in (visual_hierarchy.get("lines") or [])
+            if isinstance(row, dict) and isinstance(row.get("lineIndex"), int)
+        }
+        candidates: list[EntityCandidate] = []
+        for index, line in enumerate(header[:5]):
             upper = line.text.upper()
-            if re.search(r"[A-Za-z]{3,}", line.text) and not re.search(r"\d{4,}", line.text) and not any(term in upper for term in HEADER_SKIP_TERMS):
-                return EntityCandidate(self._title(line.text), 0.72, "header.first_text", [line.index], {"line": line.text})
-        return None
+            if (
+                re.search(r"[A-Za-z]{3,}", line.text)
+                and not re.search(r"\d{4,}", line.text)
+                and not re.search(r"\d{1,7}(?:[.,]\d{2})", line.text)
+                and not any(term in upper for term in HEADER_SKIP_TERMS)
+                and not self._followed_by_item_price(header, index)
+            ):
+                saliency = saliency_by_index.get(line.index, {})
+                visual_importance = float(saliency.get("visualImportance", 0.45) or 0.0)
+                zone = saliency.get("zone", "")
+                semantic_bonus = 0.14 if re.search(r"\b(?:WWW\.)?[A-Z0-9][A-Z0-9-]{2,35}\.(?:COM|NET|ORG)\b", upper) else 0.0
+                zone_bonus = 0.1 if zone in {"merchant_zone", "header_zone"} else 0.0
+                confidence = min(0.96, 0.42 + (visual_importance * 0.36) + semantic_bonus + zone_bonus)
+                if visual_importance < 0.34 and any(term in upper for term in LEGAL_DISCLAIMER_TERMS):
+                    confidence = min(confidence, 0.28)
+                candidates.append(EntityCandidate(
+                    self._title(line.text),
+                    confidence,
+                    "visual_hierarchy.header_candidate",
+                    [line.index],
+                    {
+                        "line": line.text,
+                        "visualImportance": visual_importance,
+                        "zone": zone,
+                        "saliencyTier": saliency.get("saliencyTier", ""),
+                    },
+                ))
+        candidates = [candidate for candidate in candidates if candidate.confidence >= 0.62]
+        return max(candidates, key=lambda candidate: candidate.confidence) if candidates else None
+
+    def _followed_by_item_price(self, lines: list[EntityLine], index: int) -> bool:
+        for candidate in lines[index + 1: min(len(lines), index + 4)]:
+            text = compact(candidate.text)
+            if re.fullmatch(r"\d{1,3}", text):
+                continue
+            if re.search(r"-?\$?\d{1,7}(?:[.,]\d{2})\s*$", text):
+                return True
+            if re.search(r"[A-Za-z]{3,}", text):
+                return False
+        return False
 
     def _address(self, lines: list[EntityLine]) -> EntityCandidate | None:
         candidates: list[EntityCandidate] = []
@@ -192,6 +247,8 @@ class HeaderEntityParser:
     def _street_candidate(self, text: str) -> tuple[str, float, list[str]]:
         upper = compact(text).upper()
         reasons: list[str] = []
+        if re.search(r"[{}\[\]|]", upper):
+            return "", 0.0, ["ocr_corrupt_address_punctuation"]
         if not re.search(r"\b\d{2,6}\b", upper):
             return "", 0.0, ["missing_street_number"]
         if self._looks_like_transaction_line(upper):
@@ -263,6 +320,62 @@ class HeaderEntityParser:
                 return EntityCandidate(match.group(0), 0.9, "header.phone_regex", [line.index], {"line": line.text})
         return None
 
+    def _date(self, lines: list[EntityLine]) -> EntityCandidate | None:
+        patterns = (
+            r"\b(\d{4}[-/]\d{1,2}[-/]\d{1,2})\b",
+            r"\b(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})\b",
+            r"\b((?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|SEPT|OCT|NOV|DEC)[A-Z]*\.?\s+\d{1,2},?\s+\d{2,4})\b",
+        )
+        for line in lines[:24]:
+            upper = line.text.upper()
+            if any(token in upper for token in ("RETURN POLICY", "POLICY", "THRU", "EXPIRES", "EXPIRATION", "VALID UNTIL")):
+                continue
+            if self._looks_like_transaction_line(upper) and not re.search(r"\bDATE\b", upper):
+                continue
+            for pattern in patterns:
+                match = re.search(pattern, line.text, flags=re.IGNORECASE)
+                if match and self._valid_date_candidate(match.group(1)):
+                    return EntityCandidate(self._normalize_date_value(match.group(1)), 0.86, "header.date_regex", [line.index], {"line": line.text})
+        return None
+
+    def _valid_date_candidate(self, value: str) -> bool:
+        text = compact(value).upper().strip()
+        numeric_match = re.fullmatch(r"(\d{1,4})[-/](\d{1,2})[-/](\d{1,4})", text)
+        if numeric_match:
+            first, second, third = [int(part) for part in numeric_match.groups()]
+            if len(numeric_match.group(1)) == 4:
+                year, month, day = first, second, third
+            else:
+                month, day, year = first, second, third
+                if year < 100:
+                    year += 2000
+            return 1 <= month <= 12 and 1 <= day <= 31 and 1990 <= year <= 2100
+        month_match = re.search(
+            r"\b(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|SEPT|OCT|NOV|DEC)[A-Z]*\.?\s+(\d{1,2}),?\s+(\d{2,4})\b",
+            text,
+        )
+        if month_match:
+            day = int(month_match.group(1))
+            year = int(month_match.group(2))
+            if year < 100:
+                year += 2000
+            return 1 <= day <= 31 and 1990 <= year <= 2100
+        return False
+
+    def _normalize_date_value(self, value: str) -> str:
+        text = compact(value).upper().strip()
+        numeric_match = re.fullmatch(r"(\d{1,4})[-/](\d{1,2})[-/](\d{1,4})", text)
+        if numeric_match:
+            first, second, third = numeric_match.groups()
+            if len(first) == 4:
+                year, month, day = first, second, third
+            else:
+                month, day, year = first, second, third
+                if len(year) == 2:
+                    year = f"20{year}"
+            return f"{int(month):02d}/{int(day):02d}/{year}"
+        return value
+
     def _title(self, text: str) -> str:
         words = []
         for word in compact(text).split():
@@ -324,6 +437,9 @@ class PaymentEntityParser:
                 upper = line.text.upper()
                 if self._looks_like_approval_line(upper):
                     continue
+                fuzzy_last4 = self._fuzzy_masked_last4(line.text)
+                if fuzzy_last4 and self._near_payment_context(window, line):
+                    return EntityCandidate(fuzzy_last4, 0.86, "payment.fuzzy_masked_last4", [line.index], {"line": line.text, "anchor": anchor.text})
                 for pattern_name, pattern in patterns:
                     if pattern_name == "generic_payment_line" and not self._line_has_payment_context(upper):
                         continue
@@ -339,6 +455,42 @@ class PaymentEntityParser:
                     if match:
                         return EntityCandidate(match.group(1), 0.91, "payment.last4_label_window", [line.index], {"line": line.text, "anchor": anchor.text, "label": label.text})
         return None
+
+    def _fuzzy_masked_last4(self, text: str) -> str:
+        upper = str(text or "").upper()
+        if not re.search(r"\b(?:VISA|MASTERCARD|MASTER CARD|AMEX|DISCOVER|CREDIT|DEBIT|CARD|ANEX|QHEX|EX)\b", upper):
+            return ""
+        if len(re.findall(r"[XK*]", upper)) < 6:
+            return ""
+        searchable = re.split(r"\b(?:AMOUNT|ANOUNT|ANGUNT|AUTH|RUTH|QAUTH|TOTAL|REF)\b", upper)[0]
+        matches = re.findall(r"[A-Z0-9*?]{8,}", searchable)
+        for token in reversed(matches):
+            if len(re.findall(r"[XK*]", token)) < 6:
+                continue
+            tail = re.sub(r"[^A-Z0-9?]", "", token)[-4:]
+            digits = self._normalize_masked_tail(tail)
+            if len(digits) >= 4:
+                return digits[-4:]
+        return ""
+
+    def _normalize_masked_tail(self, value: str) -> str:
+        mapping = {
+            "O": "0",
+            "Q": "0",
+            "D": "0",
+            "B": "8",
+            "H": "8",
+            "G": "8",
+            "S": "5",
+            "?": "7",
+        }
+        output = []
+        for char in re.sub(r"[^A-Z0-9?]", "", value.upper()):
+            if char.isdigit():
+                output.append(char)
+            elif char in mapping:
+                output.append(mapping[char])
+        return "".join(output)
 
     def _approval(self, windows: list[tuple[EntityLine, list[EntityLine]]]) -> EntityCandidate | None:
         patterns = [
@@ -391,15 +543,17 @@ class ReceiptEntityConfidenceEngine:
         merchant = float(header.get("merchant", {}).get("confidence") or 0)
         address = float(header.get("address", {}).get("confidence") or 0)
         phone = float(header.get("phone", {}).get("confidence") or 0)
+        date = float(header.get("date", {}).get("confidence") or 0)
         card = float(payment.get("cardType", {}).get("confidence") or 0)
         last4 = float(payment.get("lastFour", {}).get("confidence") or 0)
         approval = float(payment.get("approvalCode", {}).get("confidence") or 0)
-        overall = merchant * 0.18 + address * 0.22 + phone * 0.08 + card * 0.2 + last4 * 0.22 + approval * 0.1
+        overall = merchant * 0.16 + address * 0.19 + phone * 0.07 + date * 0.08 + card * 0.18 + last4 * 0.22 + approval * 0.1
         return {
             "overall": round(overall, 3),
             "merchant": round(merchant, 3),
             "address": round(address, 3),
             "phone": round(phone, 3),
+            "date": round(date, 3),
             "payment": round(max(card, last4, approval), 3),
             "cardType": round(card, 3),
             "lastFour": round(last4, 3),
@@ -433,6 +587,7 @@ class ReceiptEntityExtractionEngine:
             "payment": payment,
             "confidence": confidence,
             "debug": {
+                "visualHierarchy": header.get("visualHierarchy", {}),
                 "lineCount": len(geometry),
                 "lines": [
                     {
@@ -447,18 +602,21 @@ class ReceiptEntityExtractionEngine:
         }
 
     def _fields(self, header: dict[str, Any], payment: dict[str, Any]) -> dict[str, str]:
-        merchant = header.get("merchant", {}).get("value", "")
-        address = header.get("address", {}).get("value", "")
-        phone = header.get("phone", {}).get("value", "")
-        card_type = payment.get("cardType", {}).get("value", "")
-        last_four = payment.get("lastFour", {}).get("value", "")
-        approval = payment.get("approvalCode", {}).get("value", "")
-        method = payment.get("paymentMethod", {}).get("value", "")
+        merchant = self._confident_value(header.get("merchant", {}), 0.64)
+        address = self._confident_value(header.get("address", {}), 0.78)
+        phone = self._confident_value(header.get("phone", {}), 0.7)
+        date = self._confident_value(header.get("date", {}), 0.7)
+        card_type = self._confident_value(payment.get("cardType", {}), 0.7)
+        last_four = self._confident_value(payment.get("lastFour", {}), 0.7)
+        approval = self._confident_value(payment.get("approvalCode", {}), 0.7)
+        method = self._confident_value(payment.get("paymentMethod", {}), 0.7)
         return {
             "merchant": merchant,
             "address": address,
             "storeAddress": address,
             "phone": phone,
+            "date": date,
+            "purchaseDate": date,
             "paymentMethod": method,
             "cardType": card_type,
             "cardUsed": card_type,
@@ -466,3 +624,12 @@ class ReceiptEntityExtractionEngine:
             "cardLast4": last_four,
             "approvalCode": approval,
         }
+
+    def _confident_value(self, candidate: dict[str, Any], threshold: float) -> str:
+        if not isinstance(candidate, dict):
+            return ""
+        try:
+            confidence = float(candidate.get("confidence") or 0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        return str(candidate.get("value") or "") if confidence >= threshold else ""

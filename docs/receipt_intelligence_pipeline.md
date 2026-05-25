@@ -4,7 +4,7 @@
 
 ```text
 image upload
-  -> OpenCV/image preprocessing in receipt service
+  -> OpenCV/image preprocessing in ai-backend
   -> OCR text + optional OCR bounding boxes
   -> ai-backend /receipt/structure
   -> ReceiptIntelligencePipeline

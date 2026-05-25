@@ -23,6 +23,7 @@ class ReceiptImageIsolationService:
             "schemaVersion": "receipt-image-isolation-v1",
             "applied": False,
             "engine": "opencv",
+            "ocrInputPolicy": "raw_image_never_forwarded",
             "warnings": [],
             "contours": [],
             "selectedContour": None,
@@ -53,7 +54,13 @@ class ReceiptImageIsolationService:
                 normalized = self._enhance_receipt(cv2, source)
                 return ReceiptIsolationResult(
                     image_bytes=self._encode(cv2, normalized),
-                    diagnostics={**diagnostics, "applied": True, "strategy": "full_image_enhancement"},
+                    diagnostics={
+                        **diagnostics,
+                        "applied": True,
+                        "receiptIsolated": False,
+                        "backgroundRemoved": False,
+                        "strategy": "full_image_enhancement_no_raw_passthrough",
+                    },
                 )
 
             selected = candidates[0]
@@ -62,6 +69,8 @@ class ReceiptImageIsolationService:
             cleaned = self._clean_receipt_pixels(cv2, warped)
             output_bytes = self._encode(cv2, cleaned)
             diagnostics["applied"] = True
+            diagnostics["receiptIsolated"] = True
+            diagnostics["backgroundRemoved"] = True
             diagnostics["strategy"] = "largest_document_contour_perspective_warp"
             diagnostics["selectedContour"] = {
                 **selected["diagnostic"],
@@ -102,6 +111,75 @@ class ReceiptImageIsolationService:
         return resized, scale
 
     def _detect_receipt_candidates(self, cv2: Any, np: Any, image: Any) -> list[dict[str, Any]]:
+        candidates = self._detect_bright_paper_candidates(cv2, np, image)
+        candidates.extend(self._detect_edge_receipt_candidates(cv2, np, image))
+        candidates.sort(key=lambda item: item["score"], reverse=True)
+        return self._dedupe_candidates(candidates)
+
+    def _detect_bright_paper_candidates(self, cv2: Any, np: Any, image: Any) -> list[dict[str, Any]]:
+        height, width = image.shape[:2]
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+        _, threshold = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        if cv2.countNonZero(threshold) > threshold.size * 0.82:
+            threshold = cv2.adaptiveThreshold(
+                blurred,
+                255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY,
+                61,
+                -5,
+            )
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (17, 17))
+        mask = cv2.morphologyEx(threshold, cv2.MORPH_CLOSE, kernel, iterations=2)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)), iterations=1)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        image_area = float(width * height)
+        candidates: list[dict[str, Any]] = []
+        for contour in contours:
+            area = float(cv2.contourArea(contour))
+            if area < image_area * 0.10 or area > image_area * 0.96:
+                continue
+            x, y, rect_width, rect_height = cv2.boundingRect(contour)
+            if rect_width < width * 0.18 or rect_height < height * 0.22:
+                continue
+            aspect = max(rect_width, rect_height) / max(1, min(rect_width, rect_height))
+            if aspect < 1.15:
+                continue
+            quad = self._quad_from_contour(cv2, np, contour)
+            quad_area = self._quad_area(quad)
+            if quad_area < image_area * 0.10 or quad_area > image_area * 0.96:
+                continue
+            rectangularity = min(1.0, area / max(quad_area, 1.0))
+            paper_region = gray[y:y + rect_height, x:x + rect_width]
+            mean_inside = float(paper_region.mean()) if paper_region.size else 0.0
+            outside_mask = np.ones(gray.shape, dtype=np.uint8) * 255
+            cv2.drawContours(outside_mask, [contour], -1, 0, thickness=cv2.FILLED)
+            outside_pixels = gray[outside_mask > 0]
+            mean_outside = float(outside_pixels.mean()) if outside_pixels.size else mean_inside
+            brightness_contrast = max(0.0, min(0.28, (mean_inside - mean_outside) / 255.0))
+            center_x = x + rect_width / 2
+            center_offset = abs(center_x - width / 2) / max(width / 2, 1)
+            center_bonus = max(0.0, 0.12 * (1.0 - center_offset))
+            long_receipt_bonus = 0.18 if aspect >= 1.55 else 0.0
+            score = (quad_area / image_area) + (rectangularity * 0.42) + long_receipt_bonus + brightness_contrast + center_bonus
+            candidates.append({
+                "quad": quad,
+                "score": score,
+                "diagnostic": {
+                    "strategy": "bright_paper_region",
+                    "areaRatio": round(quad_area / image_area, 4),
+                    "contourAreaRatio": round(area / image_area, 4),
+                    "rectangularity": round(rectangularity, 4),
+                    "aspectRatio": round(aspect, 4),
+                    "meanInside": round(mean_inside, 2),
+                    "meanOutside": round(mean_outside, 2),
+                    "score": round(score, 4),
+                },
+            })
+        return candidates
+
+    def _detect_edge_receipt_candidates(self, cv2: Any, np: Any, image: Any) -> list[dict[str, Any]]:
         height, width = image.shape[:2]
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         gray = cv2.bilateralFilter(gray, 7, 45, 45)
@@ -145,6 +223,7 @@ class ReceiptImageIsolationService:
                 "quad": quad,
                 "score": score,
                 "diagnostic": {
+                    "strategy": "edge_document_contour",
                     "areaRatio": round(quad_area / image_area, 4),
                     "contourAreaRatio": round(area / image_area, 4),
                     "rectangularity": round(rectangularity, 4),
@@ -152,8 +231,28 @@ class ReceiptImageIsolationService:
                     "score": round(score, 4),
                 },
             })
-        candidates.sort(key=lambda item: item["score"], reverse=True)
         return candidates
+
+    def _dedupe_candidates(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        output: list[dict[str, Any]] = []
+        seen: set[tuple[int, int, int, int]] = set()
+        for candidate in candidates:
+            quad = candidate.get("quad")
+            if quad is None:
+                continue
+            xs = [float(point[0]) for point in quad]
+            ys = [float(point[1]) for point in quad]
+            key = (
+                round(min(xs) / 20),
+                round(min(ys) / 20),
+                round(max(xs) / 20),
+                round(max(ys) / 20),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            output.append(candidate)
+        return output
 
     def _quad_from_contour(self, cv2: Any, np: Any, contour: Any) -> Any:
         rect = cv2.minAreaRect(contour)

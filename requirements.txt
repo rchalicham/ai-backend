@@ -8,3 +8,4 @@ pymongo==4.8.0
 rapidfuzz==3.9.7
 numpy==1.26.4
 opencv-python-headless==4.10.0.84
+pytesseract==0.3.13

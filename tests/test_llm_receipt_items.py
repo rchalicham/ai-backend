@@ -353,3 +353,31 @@ $2.89
     assert [(item["name"], item["qty"], item["amount"]) for item in receipt["items"]] == [
         ("SRTGA SPRK SPRNG Wi", "1", "2.89")
     ]
+
+
+def test_llm_finalize_prefers_reconciled_table_items_over_single_subtotal_item():
+    service = LLMService()
+    structured = {
+        "subtotal": "912.20",
+        "total": "980.84",
+        "items": [
+            {"name": "Garlic Naan", "qty": "1", "amount": "912.20"},
+        ],
+    }
+    intelligence_items = [
+        {"name": "Custom Item", "qty": "3", "amount": "390.00", "confidence": 1.0},
+        {"name": "Custom Item", "qty": "2", "amount": "130.00", "confidence": 1.0},
+        {"name": "Custom Item", "qty": "1", "amount": "120.00", "confidence": 1.0},
+        {"name": "Custom Item", "qty": "50", "amount": "62.50", "confidence": 1.0},
+        {"name": "Butter Naan", "qty": "30", "amount": "89.70", "confidence": 1.0},
+        {"name": "Garlic Naan", "qty": "30", "amount": "120.00", "confidence": 1.0},
+    ]
+
+    selected = service._prefer_reconciled_intelligence_items(
+        structured,
+        service._normalize_intelligence_items(intelligence_items),
+    )
+
+    assert len(selected) == 6
+    assert sum(float(item["amount"]) for item in selected) == 912.2
+    assert all(item["amount"] != "912.20" for item in selected)

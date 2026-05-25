@@ -107,6 +107,20 @@ TOTAL 2.89
     assert normalized["receiptEntities"]["schemaVersion"] == "receipt-entities-v1"
 
 
+def test_masked_card_ocr_confusions_extract_last_four():
+    raw_text = """
+LOWE'S HOME CENTERS, LLC
+AMEX: XXXNXXKXKAXXBOO? ANOUNT: 103.08 RUTHUO: 86s686
+"""
+
+    semantic = ReceiptIntelligencePipeline().to_structured_json(raw_text=raw_text)
+
+    assert semantic["cardUsed"] == "AMEX"
+    assert semantic["cardLast4"] == "8007"
+    assert semantic["lastFour"] == "8007"
+    assert semantic["paymentCard"]["last4"] == "8007"
+
+
 def test_address_heuristics_support_zip_units_and_city_state_without_comma():
     raw_text = """
 CVS
@@ -135,3 +149,21 @@ VISA CREDIT
     fields = ReceiptEntityExtractionEngine().extract(raw_text=raw_text)["fields"]
 
     assert fields["address"] == ""
+
+
+def test_visual_hierarchy_deprioritizes_disclaimer_as_merchant():
+    boxes = [
+        {"text": "Void where prohibited", "x": 210, "y": 18, "width": 115, "height": 8, "confidence": 0.96},
+        {"text": "BRIGHT MARKET", "x": 80, "y": 58, "width": 280, "height": 26, "confidence": 0.98},
+        {"text": "123 MAIN STREET", "x": 90, "y": 105, "width": 180, "height": 14, "confidence": 0.94},
+        {"text": "APPLES 3.25", "x": 42, "y": 210, "width": 260, "height": 14, "confidence": 0.92},
+        {"text": "TOTAL 3.25", "x": 42, "y": 300, "width": 260, "height": 14, "confidence": 0.92},
+    ]
+
+    result = ReceiptEntityExtractionEngine().extract(ocr_blocks=boxes)
+
+    assert result["fields"]["merchant"] == "BRIGHT MARKET"
+    ranking = result["debug"]["visualHierarchy"]["debug"]["merchantCandidateRanking"]
+    assert ranking[0]["text"] == "BRIGHT MARKET"
+    disclaimer = next(row for row in result["debug"]["visualHierarchy"]["lines"] if row["text"] == "Void where prohibited")
+    assert disclaimer["saliencyTier"] == "LOW"
