@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -42,11 +43,27 @@ class ReceiptOcrService:
             image = cv2.imdecode(data, cv2.IMREAD_COLOR)
             if image is None:
                 return ReceiptOcrResult(available=False, warning="unable_to_decode_image")
-            prepared = self._prepare_for_ocr(cv2, image)
-            config = "--oem 3 --psm 6 -c preserve_interword_spaces=1"
-            ocr_data = pytesseract.image_to_data(prepared, output_type=pytesseract.Output.DICT, config=config)
-            blocks = self._blocks_from_tesseract(ocr_data)
-            lines = self._lines_from_blocks(blocks)
+            candidates = [
+                ("prepared_psm6", self._prepare_for_ocr(cv2, image), "--oem 3 --psm 6 -c preserve_interword_spaces=1"),
+                ("gray_psm4", self._upscale_for_ocr(cv2, cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)), "--oem 3 --psm 4 -c preserve_interword_spaces=1"),
+                ("gray_psm6", self._upscale_for_ocr(cv2, cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)), "--oem 3 --psm 6 -c preserve_interword_spaces=1"),
+            ]
+            best_blocks: list[dict[str, Any]] = []
+            best_lines: list[str] = []
+            best_score = -1.0
+            best_engine = "tesseract"
+            for name, candidate_image, config in candidates:
+                ocr_data = pytesseract.image_to_data(candidate_image, output_type=pytesseract.Output.DICT, config=config)
+                blocks = self._blocks_from_tesseract(ocr_data)
+                lines = self._lines_from_blocks(blocks)
+                score = self._ocr_line_score(lines)
+                if score > best_score:
+                    best_score = score
+                    best_blocks = blocks
+                    best_lines = lines
+                    best_engine = f"tesseract:{name}"
+            blocks = best_blocks
+            lines = best_lines
             raw_text = "\n".join(lines)
             return ReceiptOcrResult(
                 available=bool(raw_text.strip()),
@@ -54,6 +71,7 @@ class ReceiptOcrService:
                 lines=lines,
                 ocr_blocks=blocks,
                 warning="" if raw_text.strip() else "no_text_detected",
+                engine=best_engine,
             )
         except Exception as exc:
             return ReceiptOcrResult(available=False, warning=f"ocr_failed:{exc.__class__.__name__}")
@@ -77,6 +95,24 @@ class ReceiptOcrService:
             41,
             9,
         )
+
+    def _upscale_for_ocr(self, cv2: Any, image: Any) -> Any:
+        height, width = image.shape[:2]
+        scale = max(1.0, min(2.4, 1200.0 / max(width, 1)))
+        if scale <= 1.01:
+            return image
+        return cv2.resize(image, (int(width * scale), int(height * scale)), interpolation=cv2.INTER_CUBIC)
+
+    def _ocr_line_score(self, lines: list[str]) -> float:
+        text = "\n".join(lines).upper()
+        item_like = sum(
+            1 for line in lines
+            if any(char.isalpha() for char in line) and bool(re.search(r"\d{1,4}[.,]\d{2}", line))
+        )
+        department_hits = sum(1 for term in ("DAIRY", "GROCERY", "PRODUCE") if term in text)
+        total_hits = sum(1 for term in ("BALANCE DUE", "TOTAL TAX", "ITEMS SOLD", "TOTAL NUMBER") if term in text)
+        legal_penalty = text.count("SWEEPSTAKES") + text.count("NO PURCHASE") + text.count("SURVEY")
+        return (item_like * 4.0) + (department_hits * 5.0) + (total_hits * 2.0) - (legal_penalty * 1.5) + min(len(lines), 90) * 0.02
 
     def _blocks_from_tesseract(self, data: dict[str, list[Any]]) -> list[dict[str, Any]]:
         count = len(data.get("text", []))

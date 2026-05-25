@@ -223,8 +223,9 @@ def test_receipt_item_count_overrides_stale_fallback_totals_from_ocr_lines():
     assert normalized["subtotal"] == "244.36"
     assert normalized["tax"] == "1.44"
     assert normalized["total"] == "245.80"
-    assert normalized["rowConsolidation"]["reconciliation"]["matched"] is True
+    assert normalized["rowConsolidation"]["reconciliation"]["matched"] is False
     assert normalized["rowConsolidation"]["reconciliation"]["itemCountTarget"] == 14
+    assert "item_sum_does_not_match_receipt_total" in normalized["rowConsolidation"]["reconciliation"]["warnings"]
     assert {item["name"] for item in normalized["items"]} >= {"GOATCUBEISLB", "PART SHREDS", "THIGH MEAT"}
 
 
@@ -256,3 +257,67 @@ def test_standalone_minus_lines_attach_as_previous_item_discounts_and_address_su
     assert items["SPINDRIFT"]["discount"] == "5.20"
     assert items["SPINDRIFT"]["netAmount"] == "13.79"
     assert all(not item["name"].endswith("-") for item in normalized["items"])
+
+
+def test_fresh_thyme_department_rows_survive_legal_header_and_weighted_produce():
+    pipeline = ReceiptRowConsolidationPipeline()
+    lines = [
+        "FRESHTHYME. COM",
+        "AMERICAN EXPRESS Entry Method: Chip",
+        "01/16/2025 11:10:18",
+        "Total: USD$ 37.07",
+        "APPROVED 887973",
+        "DATiny",
+        "0 EGGS PSTURE RSD 6.99 NF",
+        "GROCERY",
+        "O BROWN RICE LONG GR 2.19 N f",
+        "O MARUCHAN RAMEN CHT 0.39 NF",
+        "O MARUCHAN RAMEN CHT 0.39 NF",
+        "0 ORG COCNT MILK 2.59 NF",
+        "PRODUCE",
+        "OCUCUMBERS GREEN 1.99 N f",
+        "O CUCUMBERS GREEN 1.99 N F",
+        "O ORG BUNCH CARRO 2.99 NF",
+        "O RED ONION 2LB 2.99 N |",
+        "0 RED ONION 2LB 2.99 N F",
+        "O RED ONION 2LB 2.99 .N.F",
+        "O-RED ROSE POTATO x",
+        "2.02 lb @ 0.77/ lb 1.56 NF",
+        "You saved 1.05",
+        "0 SPICY GUACAMOLE 4.99 tIF",
+        "O SWEET POTATO",
+        "1.26 lb @ 1.29/ lb 1.63 Nf",
+        "BALANCE DUE 37.07",
+        "American Express 37.07",
+        "CHANGE 0.00",
+        "TAX-CODE TAXABLE-VAL TAX-VALUE",
+        "Tax 1 4.99 0.06",
+        "Tax 2 4.99 0.34",
+        "TOTAL TAX 0.40",
+        "TOTAL DISCOUNTS 1 1.05",
+        "Total number of items sold = 14",
+        "STORE:00508 REGISTER:012 CASHIER:0912",
+        "TICKET#:9646 16JAN2025 11:10:20",
+        "NO PURCHASE NECESSARY TO ENTER SWEEPSTAKES",
+    ]
+
+    normalized = pipeline.normalize(
+        {"available": True, "merchant": "FRESHTHYME", "items": [], "raw": {}},
+        raw_text="\n".join(lines),
+        lines=lines,
+        parser_json={"company": "FRESHTHYME"},
+    )
+
+    item_names = [item["name"] for item in normalized["items"]]
+    amounts = {item["name"]: item["amount"] for item in normalized["items"]}
+
+    assert len(normalized["items"]) == 14
+    assert normalized["total"] == "37.07"
+    assert normalized["tax"] == "0.40"
+    assert normalized["rowConsolidation"]["reconciliation"]["matched"] is True
+    assert normalized["rowConsolidation"]["reconciliation"]["itemCountTarget"] == 14
+    assert item_names.count("MARUCHAN RAMEN CHT") == 2
+    assert item_names.count("RED ONION 2LB") == 3
+    assert amounts["RED ROSE POTATO x"] == "1.56"
+    assert amounts["SWEET POTATO"] == "1.63"
+    assert not any("SWEEPSTAKES" in name.upper() or "YOU SAVED" in name.upper() or "TOTAL DISCOUNTS" in name.upper() for name in item_names)

@@ -271,3 +271,22 @@ def test_human_review_task_adds_image_quality_risk():
     assert review["required"] is True
     assert any(reason["reason"] == "image_quality_risk" for reason in review["reasons"])
     assert review["riskScore"] >= 24
+
+
+def test_attempt_scoring_penalizes_tiny_subset_when_receipt_item_count_exists():
+    agent = _agent()
+    tiny_subset = {
+        "items": [{"name": "O/N", "amount": "14.99"}],
+        "facts": {"total": "14.99", "tax": "1.44"},
+        "confidence": {"overall": 0.91},
+        "validation": {"valid": True, "warnings": []},
+    }
+    complete_but_noisy = {
+        "items": [{"name": f"ITEM {index}", "amount": "1.00"} for index in range(14)],
+        "facts": {"subtotal": "244.36", "tax": "1.44", "total": "245.80"},
+        "confidence": {"overall": 0.70},
+        "validation": {"valid": False, "warnings": ["item_sum_does_not_match_receipt_total"]},
+    }
+    donut = {"rowConsolidation": {"reconciliation": {"itemCountTarget": 14}}}
+
+    assert agent._score_attempt(complete_but_noisy, None, donut) > agent._score_attempt(tiny_subset, None, donut)

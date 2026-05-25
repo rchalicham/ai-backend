@@ -27,8 +27,16 @@ RECEIPT_TOTAL_TERMS = (
 RECEIPT_FOOTER_TERMS = (
     "THANK", "SURVEY", "FEEDBACK", "RETURN POLICY", "COME AGAIN", "SAVINGS",
     "ITEM COUNT", "SOLD ITEM", "STORE", "PHARMACY", "ROAD", "STREET", "PLYMOUTH",
-    "BARCODE", "COUPON", "REWARD",
+    "BARCODE", "COUPON", "REWARD", "YOU SAVED", "TOTAL DISCOUNTS",
 )
+
+RECEIPT_LEGAL_PROMO_TERMS = (
+    "SWEEPSTAKES", "NO PURCHASE", "VOID WHERE", "PROHIBITED", "OFFICIAL RULES",
+    "FRESH THYME GIFT", "GIFT CARD", "ENTER TO WIN", "SURVEY", "PROVIDE SPECIFIC",
+    "PURCHASE RECEIPT", "GOOD LUCK",
+)
+
+RECEIPT_DEPARTMENT_TERMS = ("DAIRY", "DATINY", "GROCERY", "PRODUCE")
 
 PRODUCT_STOPWORDS = {
     "REG", "TRN", "CSHR", "STR", "ROAD", "NORTH", "STORE", "PHARMACY", "EA",
@@ -91,7 +99,7 @@ def _compact(value: Any) -> str:
 
 
 def _amount(value: Any) -> str:
-    text = str(value or "").replace("$", "").replace(",", ".")
+    text = re.sub(r"(?<=\d):(?=\d{2}\b)", ".", str(value or "")).replace("$", "").replace(",", ".")
     match = re.search(r"-?\d{1,6}(?:\.\d{2})(?=\b|[A-Z])", text, flags=re.IGNORECASE)
     if match:
         return match.group(0)
@@ -242,7 +250,7 @@ class ReceiptCandidateExtractor:
                 if pending:
                     pending_description = (pending, index)
                 continue
-            if pending_description and self._amount_only_or_noise_price_line(line):
+            if pending_description and (self._amount_only_or_noise_price_line(line) or self._weighted_price_line(line)):
                 match = {"name": pending_description[0], "amount": match["amount"]}
                 pending_description = None
             else:
@@ -262,7 +270,7 @@ class ReceiptCandidateExtractor:
     def _pending_description(self, line: str) -> str:
         text = _compact(line)
         upper = text.upper()
-        if any(term in upper for term in RECEIPT_TOTAL_TERMS + RECEIPT_FOOTER_TERMS):
+        if any(term in upper for term in RECEIPT_TOTAL_TERMS + RECEIPT_FOOTER_TERMS + RECEIPT_LEGAL_PROMO_TERMS):
             return ""
         if re.search(r"\d{1,6}(?:[.,]\d{2})", text):
             return ""
@@ -276,19 +284,24 @@ class ReceiptCandidateExtractor:
         text = _compact(line)
         return bool(re.fullmatch(r"[^A-Za-z]{0,12}\d{1,6}(?:[.,]\d{2})[^A-Za-z]{0,12}", text))
 
+    def _weighted_price_line(self, line: str) -> bool:
+        return bool(re.search(r"\b\d+(?:[.,]\d+)?\s*(?:LB|LBS)\s*@", _compact(line).upper()))
+
     def _line_item_match(self, line: str) -> dict[str, str] | None:
         text = _compact(line)
         upper = text.upper()
+        if any(term in upper for term in RECEIPT_LEGAL_PROMO_TERMS):
+            return None
         if any(term in upper for term in RECEIPT_TOTAL_TERMS + RECEIPT_FOOTER_TERMS):
             return None
         if any(term in upper for term in ("APPROVED", "AUTH", "TRAN ", "TRAN:", "AMOUNT:", "AID:", "VISA RESP", "XXXXXXXX")):
             return None
         if re.search(r"\b[A-Z]{2}\s+\d{5}(?:-\d{4})?\b", upper) or any(term in upper for term in (" DR", " DRIVE", " ST ", " STREET", " ROAD", " AVE", " AVENUE")):
             return None
-        amounts = list(re.finditer(r"-?\d{1,6}(?:[.,]\d{2})", text))
+        amounts = list(re.finditer(r"-?\d{1,6}(?:[.,:]\d{2})", text))
         if not amounts:
             amounts = list(re.finditer(r"\b\d{4,5}\b", text))
-        if len(amounts) > 1:
+        if len(amounts) > 1 and not re.search(r"\b\d+(?:[.,]\d+)?\s*(?:LB|LBS)\s*@", upper):
             return None
         if not amounts:
             return None
@@ -297,13 +310,17 @@ class ReceiptCandidateExtractor:
         if re.search(r"\d{2,}", trailing):
             return None
         name = text[:amount_match.start()].strip(" -:|\\/*'\"“”[](){}")
+        if re.search(r"\b\d+(?:[.,]\d+)?\s*(?:LB|LBS)\s*@", upper):
+            previous_name = self._pending_description(text)
+            if previous_name:
+                name = previous_name
         name = self._clean_ocr_item_name(name)
         if len(re.findall(r"[A-Za-z]", name)) < 3 and not re.search(r"\bO\s*/?\s*N\b", name, flags=re.IGNORECASE):
             return None
         return {"name": name, "amount": self._normalize_ocr_line_amount(amount_match.group(0))}
 
     def _normalize_ocr_line_amount(self, value: str) -> str:
-        text = str(value or "").replace(",", ".")
+        text = re.sub(r"(?<=\d):(?=\d{2}\b)", ".", str(value or "")).replace(",", ".")
         if "." in text:
             return text
         if re.fullmatch(r"\d{4,5}", text):
@@ -317,6 +334,7 @@ class ReceiptCandidateExtractor:
     def _clean_ocr_item_name(self, name: str) -> str:
         cleaned = _compact(name)
         cleaned = re.sub(r"^[^A-Za-z]+", "", cleaned)
+        cleaned = re.sub(r"^(?:O|0)\s*[-:]\s*(?=[A-Z]{2,})", "", cleaned, flags=re.IGNORECASE)
         sku_match = re.match(r"^.{0,24}?\b\d{4,}\s+(.+)$", cleaned)
         if sku_match:
             cleaned = sku_match.group(1)
@@ -331,7 +349,7 @@ class ReceiptCandidateExtractor:
 
     def _strip_leading_ocr_noise_tokens(self, value: str) -> str:
         tokens = _compact(value).split()
-        noisy = {"E", "E+", "EY", "EL", "HE", "SH", "OE", "SA", "F", "CF"}
+        noisy = {"E", "E+", "EY", "EL", "HE", "SH", "OE", "SA", "F", "CF", "O", "0"}
         while tokens:
             normalized = re.sub(r"[^A-Z+]", "", tokens[0].upper())
             if normalized in noisy or re.fullmatch(r"\d{3,}", tokens[0]):
@@ -435,7 +453,7 @@ class ReceiptCandidateExtractor:
                 continue
             candidates.append(CandidateRow(
                 source="section.items",
-                name=_compact(item.get("name") or item.get("description") or item.get("item")),
+                name=self._clean_ocr_item_name(item.get("name") or item.get("description") or item.get("item")),
                 amount=_amount(item.get("amount") or item.get("price") or item.get("total")),
                 qty=self._qty(item.get("qty") or item.get("count") or item.get("quantity")),
                 confidence=float(item.get("confidence") or 0.68),
@@ -479,7 +497,13 @@ class ReceiptCandidateExtractor:
 
     def _qty(self, value: Any) -> str:
         match = re.search(r"\d+(?:[.,]\d+)?", str(value or ""))
-        return match.group(0).replace(",", ".") if match else "1"
+        if not match:
+            return "1"
+        qty = match.group(0).replace(",", ".")
+        try:
+            return qty if float(qty) > 0 else "1"
+        except ValueError:
+            return "1"
 
 
 class ReceiptRowValidator:
@@ -497,6 +521,8 @@ class ReceiptRowValidator:
             reasons.append("invalid_product_name")
         if any(term in upper for term in RECEIPT_TOTAL_TERMS):
             reasons.append("receipt_level_term")
+        if any(term in upper for term in ("YOU SAVED", "TOTAL DISCOUNTS", "SAVINGS TODAY")):
+            reasons.append("discount_summary_row")
         if self._near_receipt_level_term(canonical):
             reasons.append("ocr_mutation_of_receipt_level_term")
         if any(term in upper for term in RECEIPT_FOOTER_TERMS) and len(canonical.split()) > 4:
@@ -529,6 +555,7 @@ class ReceiptRowValidator:
             "missing_or_zero_amount",
             "survey_or_barcode_numeric_row",
             "low_source_confidence",
+            "discount_summary_row",
         }
         if "weak_name_matches_receipt_total" in reasons and "short_single_token_product_name" in reasons:
             hard_rejects.add("weak_name_matches_receipt_total")
@@ -586,6 +613,13 @@ class ReceiptDuplicateClusterer:
             for cluster in clusters:
                 representative = cluster[0]
                 same_price = abs(representative.amount_value - row.amount_value) <= 0.01
+                if same_price and row.source == "ocr.line" and row.line_index is not None:
+                    existing_ocr_lines = [
+                        member.line_index for member in cluster
+                        if member.source == "ocr.line" and member.line_index is not None
+                    ]
+                    if any(line_index != row.line_index for line_index in existing_ocr_lines):
+                        continue
                 similarity = _similarity(representative.name, row.name)
                 nearby_y = self._nearby_y(representative, row)
                 overlapping_tokens = self._overlapping_product_tokens(representative.name, row.name)
@@ -800,7 +834,7 @@ class ReceiptRowConsolidationPipeline:
             ocr_blocks=ocr_blocks,
         )
         boundary_lock = self._section_boundary_lock(section_result)
-        self._apply_boundary_lock(candidates, boundary_lock)
+        self._apply_boundary_lock(candidates, boundary_lock, source_lines)
         accepted: list[CandidateRow] = []
         rejected: list[dict[str, Any]] = []
         for row in candidates:
@@ -993,7 +1027,7 @@ class ReceiptRowConsolidationPipeline:
                 inferred["subtotal"] = amount
             elif "TOTAL TAX" in upper or (re.search(r"\bTAX\b", upper) and "%" not in upper and "FSA" not in upper):
                 inferred["tax"] = amount
-            elif re.search(r"\bTOTAL\b", upper) and "TAX" not in upper and "FSA" not in upper:
+            elif re.search(r"\bTOTAL\b", upper) and "TAX" not in upper and "FSA" not in upper and "DISCOUNT" not in upper:
                 inferred["total"] = amount
             elif re.search(r"\bAMOUNT\b", upper):
                 payment_total = amount
@@ -1014,7 +1048,7 @@ class ReceiptRowConsolidationPipeline:
                 facts[key] = value
 
     def _decimal_amounts(self, line: str) -> list[str]:
-        return [match.group(0).replace(",", ".") for match in re.finditer(r"\d{1,6}[.,]\d{2}", str(line or ""))]
+        return [match.group(0).replace(",", ".").replace(":", ".") for match in re.finditer(r"\d{1,6}[.,:]\d{2}", str(line or ""))]
 
     def _sanitize_receipt_facts(self, facts: dict[str, str]) -> None:
         subtotal = _numeric_amount(facts.get("subtotal"))
@@ -1046,6 +1080,12 @@ class ReceiptRowConsolidationPipeline:
             trace = item.get("rowConfidenceTrace", {}) if isinstance(item, dict) else {}
             selected = trace.get("selected", {}) if isinstance(trace, dict) else {}
             line_index = selected.get("lineIndex")
+            if not isinstance(line_index, int):
+                for alternate in trace.get("alternates", []) if isinstance(trace.get("alternates"), list) else []:
+                    alternate_index = alternate.get("lineIndex") if isinstance(alternate, dict) else None
+                    if isinstance(alternate_index, int):
+                        line_index = alternate_index
+                        break
             if isinstance(line_index, int):
                 line_items.append((line_index, item))
         if not line_items:
@@ -1107,11 +1147,14 @@ class ReceiptRowConsolidationPipeline:
         lock = debug.get("itemBoundaryLock", {}) if isinstance(debug, dict) else {}
         return lock if isinstance(lock, dict) else {}
 
-    def _apply_boundary_lock(self, candidates: list[CandidateRow], lock: dict[str, Any]) -> None:
+    def _apply_boundary_lock(self, candidates: list[CandidateRow], lock: dict[str, Any], lines: list[str]) -> None:
         first_index = lock.get("firstLockedIndex")
         first_y = lock.get("firstLockedY")
         for row in candidates:
             line_index = row.raw.get("lineIndex") if isinstance(row.raw, dict) else None
+            if isinstance(line_index, int) and self._inside_department_item_window(lines, line_index):
+                row.section = "items"
+                continue
             if first_index is not None and isinstance(line_index, int) and line_index >= int(first_index):
                 row.section = "totals"
                 row.reasons.append("boundary_locked_after_totals")
@@ -1125,6 +1168,28 @@ class ReceiptRowConsolidationPipeline:
                         row.reasons.append("boundary_locked_by_y_position")
                 except (TypeError, ValueError):
                     pass
+
+    def _inside_department_item_window(self, lines: list[str], index: int) -> bool:
+        if index < 0 or index >= len(lines):
+            return False
+        seen_department = False
+        for cursor in range(index, -1, -1):
+            upper = _compact(lines[cursor]).upper()
+            if any(term in upper for term in RECEIPT_DEPARTMENT_TERMS):
+                seen_department = True
+                break
+            if cursor != index and any(term in upper for term in ("BALANCE DUE", "TOTAL TAX", "TAX-CODE", "TOTAL DISCOUNTS", "ITEMS SOLD")):
+                return False
+        if not seen_department:
+            return False
+        upper_line = _compact(lines[index]).upper()
+        if any(term in upper_line for term in ("BALANCE DUE", "TOTAL TAX", "TAX-CODE", "TOTAL DISCOUNTS", "CHANGE", "AUTH CODE", "AMERICAN EXPRESS")):
+            return False
+        for cursor in range(index + 1, min(len(lines), index + 8)):
+            upper = _compact(lines[cursor]).upper()
+            if any(term in upper for term in ("BALANCE DUE", "TOTAL TAX", "TAX-CODE", "TOTAL DISCOUNTS", "CHANGE")):
+                return True
+        return bool(re.search(r"[A-Z]{3,}", upper_line) and re.search(r"\d{1,5}(?:[.,]\d{2})", upper_line))
 
     def _overall_confidence(
         self,

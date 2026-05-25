@@ -452,6 +452,7 @@ class PaymentEntityParser:
     def _last_four(self, windows: list[tuple[EntityLine, list[EntityLine]]]) -> EntityCandidate | None:
         patterns = [
             ("masked_pan", r"(?:[*X]{4,}|ENDING\s+IN|CARD\s*#?)\D{0,8}(\d{4})\b"),
+            ("short_masked_pan", r"[(*\s]*(?:[*XK]{2,})\D{0,4}(\d{4})\b"),
             ("last_four_label", r"\bLAST\s*(?:FOUR|4)\D{0,12}(\d{4})\b"),
             ("card_brand", r"\b(?:VISA|MASTERCARD|MASTER CARD|AMEX|DISCOVER)\D{0,20}(\d{4})\b"),
             ("generic_payment_line", r"\b(\d{4})\b"),

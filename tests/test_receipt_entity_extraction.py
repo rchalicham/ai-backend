@@ -121,6 +121,24 @@ AMEX: XXXNXXKXKAXXBOO? ANOUNT: 103.08 RUTHUO: 86s686
     assert semantic["paymentCard"]["last4"] == "8007"
 
 
+def test_short_masked_card_line_extracts_last_four_in_payment_window():
+    raw_text = """
+COSTCO WHOLESALE
+SUBTOTAL 244.36
+TAX 1.44
+TOTAL 245.80
+(XX3442 H
+Visa Resp: APPROVED
+AMOUNT: $245.80
+"""
+
+    semantic = ReceiptIntelligencePipeline().to_structured_json(raw_text=raw_text)
+
+    assert semantic["cardUsed"] == "VISA"
+    assert semantic["cardLast4"] == "3442"
+    assert semantic["lastFour"] == "3442"
+
+
 def test_address_heuristics_support_zip_units_and_city_state_without_comma():
     raw_text = """
 CVS

@@ -61,6 +61,7 @@ class ReceiptAgentOrchestrator:
         self.max_attempts = int(os.getenv("RECEIPT_AGENT_MAX_ATTEMPTS", "3"))
         self.accept_confidence = float(os.getenv("RECEIPT_AGENT_ACCEPT_CONFIDENCE", "0.82"))
         self.review_confidence = float(os.getenv("RECEIPT_AGENT_REVIEW_CONFIDENCE", "0.78"))
+        self.ocr_first_reprocess = os.getenv("RECEIPT_AGENT_OCR_FIRST_REPROCESS", "true").lower() not in {"0", "false", "no"}
 
     async def process(
         self,
@@ -130,7 +131,12 @@ class ReceiptAgentOrchestrator:
         run_llama: bool,
     ) -> ReceiptAgentAttempt:
         image_bytes = source.get("imageBytes") or b""
-        donut_json = await self.donut_receipt_service.analyze_image_bytes(image_bytes) if image_bytes else {
+        use_ocr_first = self._use_ocr_first_attempt(source, run_llama)
+        donut_json = {
+            "available": True,
+            "model": "ocr-first-reprocess",
+            "warning": "donut_skipped_for_ocr_first_reprocess",
+        } if use_ocr_first and image_bytes else await self.donut_receipt_service.analyze_image_bytes(image_bytes) if image_bytes else {
             "available": False,
             "warning": "text_only_receipt_agent_attempt",
         }
@@ -192,10 +198,18 @@ class ReceiptAgentOrchestrator:
             warnings=warnings,
         )
 
+    def _use_ocr_first_attempt(self, source: dict[str, Any], run_llama: bool) -> bool:
+        if run_llama or not self.ocr_first_reprocess:
+            return False
+        return str(source.get("strategy") or "") in {"isolate_receipt_then_ocr", "central_receipt_crop_ocr"}
+
     def _image_sources(self, image_bytes: bytes) -> list[dict[str, Any]]:
         if not image_bytes:
             return []
-        sources = [{"source": "uploaded_image", "strategy": "baseline_document_understanding", "imageBytes": image_bytes, "diagnostics": {}}]
+        sources: list[dict[str, Any]] = []
+        narrow_crop = self._narrow_receipt_crop_variant(image_bytes)
+        if narrow_crop:
+            sources.append(narrow_crop)
         isolation = self.receipt_image_isolation_service.isolate(image_bytes)
         if isolation.image_bytes:
             sources.append({
@@ -204,6 +218,7 @@ class ReceiptAgentOrchestrator:
                 "imageBytes": isolation.image_bytes,
                 "diagnostics": isolation.diagnostics,
             })
+        sources.append({"source": "uploaded_image", "strategy": "baseline_document_understanding", "imageBytes": image_bytes, "diagnostics": {}})
         sources.extend(self._opencv_retry_variants(isolation.image_bytes or image_bytes))
         deduped: list[dict[str, Any]] = []
         seen_sizes: set[tuple[str, int]] = set()
@@ -214,6 +229,46 @@ class ReceiptAgentOrchestrator:
             seen_sizes.add(key)
             deduped.append(source)
         return deduped
+
+    def _narrow_receipt_crop_variant(self, image_bytes: bytes) -> dict[str, Any] | None:
+        try:
+            import cv2
+            import numpy as np
+        except Exception:
+            return None
+        try:
+            data = np.frombuffer(image_bytes, dtype=np.uint8)
+            image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+            if image is None:
+                return None
+            height, width = image.shape[:2]
+            if height < 600 or width < 400:
+                return None
+            min_width = int(width * 0.16)
+            left, right = int(width * 0.38), int(width * 0.75)
+            margin = int(width * 0.025)
+            left = max(0, left - margin)
+            right = min(width, right + margin)
+            crop = image[:, left:right]
+            if crop.shape[1] < min_width:
+                return None
+            scale = min(2.4, max(1.2, 1200.0 / max(crop.shape[1], 1)))
+            crop = cv2.resize(crop, (int(crop.shape[1] * scale), int(crop.shape[0] * scale)), interpolation=cv2.INTER_CUBIC)
+            success, encoded = cv2.imencode(".png", crop)
+            if not success:
+                return None
+            return {
+                "source": "narrow_receipt_crop",
+                "strategy": "central_receipt_crop_ocr",
+                "imageBytes": encoded.tobytes(),
+                "diagnostics": {
+                    "schemaVersion": "receipt-agent-image-variant-v1",
+                    "strategy": "central_receipt_crop_ocr",
+                    "crop": {"left": left, "right": right, "width": right - left, "sourceWidth": width, "sourceHeight": height},
+                },
+            }
+        except Exception:
+            return None
 
     def _opencv_retry_variants(self, image_bytes: bytes) -> list[dict[str, Any]]:
         try:
@@ -286,13 +341,14 @@ class ReceiptAgentOrchestrator:
         target_count = reconciliation.get("itemCountTarget")
         actual_count = reconciliation.get("itemCountActual")
         count_matched = bool(target_count and actual_count == target_count and len(consolidated_items) == target_count)
+        arithmetic_matched = bool(reconciliation.get("matched"))
         semantic_has_receipt_level_row = any(
-            re.search(r"\b(?:TOTAL|SUBTOTAL|TAX|AMOUNT|VISA|AMEX|MASTERCARD|DISCOVER|CHANGE)\b", str(item.get("name") or ""), flags=re.IGNORECASE)
+            re.search(r"\b(?:TOTAL|SUBTOTAL|TAX|AMOUNT|VISA|AMEX|AMERICAN\s+EXPRESS|MASTERCARD|DISCOVER|CHANGE)\b", str(item.get("name") or ""), flags=re.IGNORECASE)
             for item in semantic_items
             if isinstance(item, dict)
         )
         materially_better_count = len(consolidated_items) >= max(len(semantic_items) + 3, len(semantic_items) * 2)
-        if not (count_matched or semantic_has_receipt_level_row or materially_better_count):
+        if not (arithmetic_matched or count_matched or semantic_has_receipt_level_row or materially_better_count):
             return semantic
         semantic["items"] = [
             {
@@ -342,7 +398,29 @@ class ReceiptAgentOrchestrator:
             score = min(1.0, score + 0.04)
         if validation.get("warnings"):
             score = max(0.0, score - min(0.18, len(validation["warnings"]) * 0.05))
+        item_count = len(semantic.get("items") or [])
+        target_count = self._expected_item_count(semantic, donut)
+        if target_count:
+            if item_count == target_count:
+                score = min(1.0, score + 0.16)
+            elif item_count < max(2, int(target_count * 0.5)):
+                score = max(0.0, score - 0.28)
+            elif item_count < target_count:
+                score = max(0.0, score - 0.12)
+        facts = semantic.get("facts") if isinstance(semantic.get("facts"), dict) else {}
+        if self._has_amount(facts.get("subtotal") or semantic.get("subtotal")):
+            score = min(1.0, score + 0.06)
+        if self._has_amount(facts.get("tax") or semantic.get("tax")):
+            score = min(1.0, score + 0.03)
+        if self._has_amount(facts.get("total") or semantic.get("total")):
+            score = min(1.0, score + 0.04)
         return round(score, 3)
+
+    def _has_amount(self, value: Any) -> bool:
+        try:
+            return float(str(value or "").replace("$", "").replace(",", "").strip()) > 0
+        except Exception:
+            return False
 
     def _reconcile_merchant_confidence(self, semantic: dict[str, Any], parser_json: dict[str, Any] | None = None) -> dict[str, Any]:
         if not isinstance(semantic, dict):
@@ -755,7 +833,12 @@ class ReceiptAgentOrchestrator:
             return {"field": "subtotal", "amountCents": subtotal_cents}
         return None
 
-    def _expected_item_count(self, semantic: dict[str, Any]) -> int | None:
+    def _expected_item_count(self, semantic: dict[str, Any], donut: dict[str, Any] | None = None) -> int | None:
+        donut = donut or {}
+        donut_target = ((donut.get("rowConsolidation") or {}).get("reconciliation") or {}).get("itemCountTarget")
+        parsed_donut_target = self._positive_int(donut_target)
+        if parsed_donut_target:
+            return parsed_donut_target
         section = semantic.get("sectionExtraction") if isinstance(semantic.get("sectionExtraction"), dict) else {}
         financial = section.get("financialReconciliation") if isinstance(section.get("financialReconciliation"), dict) else {}
         for value in (
