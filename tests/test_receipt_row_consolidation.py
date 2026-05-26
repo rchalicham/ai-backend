@@ -91,6 +91,87 @@ def test_rejects_serialized_hallucinated_donut_names_from_cvs_sample():
     assert normalized["rowConsolidation"]["retryPlan"]
 
 
+def test_cvs_payment_metadata_does_not_become_huge_item_or_policy_date():
+    pipeline = ReceiptRowConsolidationPipeline()
+    lines = [
+        "CVS pharmacy",
+        "4140 ROAD 101 NORTH, PLYMOUTH, MN",
+        "PHARMACY: 478-4612 STORE:",
+        "REG#04 TRN#5652 CSHR#2827889 STR#68",
+        "1 SRTGA SPRK SPRNG W 28Z 2.89F",
+        "Survey ID #",
+        "4179 9154 0417 347 13",
+        "GATT 2,89",
+        "HARGE 2,89",
+        "VISA CREDIT ************3442",
+        "APPROVED# 014417 REF# 046529",
+        "TRAN TYPE: SALE AID: A000000003101",
+        "NO SIGNATURE REQUIRED CVM: 280000",
+        "Returns with receipt, subject to",
+        "CVS Return Policy, thru 07/13/2026",
+    ]
+
+    normalized = pipeline.normalize(
+        {
+            "available": True,
+            "merchant": "Pharmacy",
+            "date": "07/13/2026",
+            "purchaseDate": "07/13/2026",
+            "items": [{"name": "TRAN TYPE: REDUIRED", "qty": "1", "amount": "280000.00", "confidence": 0.82}],
+            "total": "280000",
+            "raw": {},
+        },
+        raw_text="\n".join(lines),
+        lines=lines,
+        parser_json={"company": "CVS", "date": "07/13/2026"},
+    )
+
+    assert normalized["date"] == ""
+    assert normalized["purchaseDate"] == ""
+    assert normalized["total"] == "2.89"
+    assert normalized["charge"] == "2.89"
+    assert [(item["name"], item["amount"]) for item in normalized["items"]] == [
+        ("SRTGA SPRK SPRNG W 28Z", "2.89")
+    ]
+    assert any(row["name"] == "TRAN TYPE: REDUIRED" and "receipt_level_term" in row["reasons"] for row in normalized["rowConsolidation"]["rejectedRows"])
+
+
+def test_cvs_ocr_payment_fragments_are_rejected_and_total_uses_item_sum():
+    pipeline = ReceiptRowConsolidationPipeline()
+    lines = [
+        "CVS pharmacy",
+        "1 SRTGA SPRK SPRNG W282 2.89F",
+        "TYPE: SALE 046529",
+        "We ede 2.89",
+        "NO SIGNATURE REQUIRED CVM: 280000",
+    ]
+
+    normalized = pipeline.normalize(
+        {
+            "available": True,
+            "merchant": "Pharmacy",
+            "items": [
+                {"name": "TYPE: SALE", "qty": "1", "amount": "046529", "confidence": 0.82},
+                {"name": "SRTGA SPRK SPRNG W282", "qty": "1", "amount": "2.89", "confidence": 0.96},
+                {"name": "We ede", "qty": "1", "amount": "2.89", "confidence": 0.77},
+            ],
+            "total": "280000",
+            "raw": {},
+        },
+        raw_text="\n".join(lines),
+        lines=lines,
+        parser_json={"company": "CVS"},
+    )
+
+    assert normalized["total"] == "2.89"
+    assert [(item["name"], item["amount"]) for item in normalized["items"]] == [
+        ("SRTGA SPRK SPRNG W282", "2.89")
+    ]
+    rejected = normalized["rowConsolidation"]["rejectedRows"]
+    assert any(row["name"] == "TYPE: SALE" and "receipt_level_term" in row["reasons"] for row in rejected)
+    assert any(row["name"] == "We ede" and "weak_short_ocr_noise" in row["reasons"] for row in rejected)
+
+
 def test_subtotal_reconciliation_selects_matching_subset():
     pipeline = ReceiptRowConsolidationPipeline()
     donut = {

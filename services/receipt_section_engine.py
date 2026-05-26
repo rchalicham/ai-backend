@@ -25,7 +25,7 @@ CURRENCY_KEYWORDS = (
 PAYMENT_KEYWORDS = (
     "VISA", "MASTERCARD", "MASTER CARD", "AMEX", "AMERICAN EXPRESS", "DISCOVER",
     "CREDIT", "DEBIT", "CARD", "AUTH", "APPROVAL", "APPROVED", "AID", "ENTRY", "CHIP",
-    "LAST FOUR", "LAST 4", "CARD LAST", "ENDING IN",
+    "LAST FOUR", "LAST 4", "CARD LAST", "ENDING IN", "TRAN TYPE", "SIGNATURE", "CVM",
 )
 FOOTER_KEYWORDS = (
     "THANK", "SURVEY", "FEEDBACK", "RETURN POLICY", "COME AGAIN", "VISIT", "WWW.",
@@ -442,10 +442,11 @@ class TotalsParser:
             return "tip"
         if "CHANGE" in upper:
             return "change"
-        if "CHARGE" in upper or "AMOUNT" in upper:
+        if "CHARGE" in upper or "HARGE" in upper or "AMOUNT" in upper:
             return "charge"
         if (
             "TOTAL" in upper
+            or "GATT" in upper
             or "BALANCE" in compact_upper
             or "BAIANCE" in compact_upper
             or compact_upper in {"USD", "USDOLLAR", "DOLLARS", "TENDER", "CURRENCY"}

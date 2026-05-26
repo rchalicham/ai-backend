@@ -21,7 +21,8 @@ logger = logging.getLogger(__name__)
 RECEIPT_TOTAL_TERMS = (
     "SUBTOTAL", "SUB TOTAL", "TOTAL", "TAX", "TIP", "CHANGE", "BALANCE", "AMOUNT",
     "PAYMENT", "CASH", "CREDIT", "DEBIT", "VISA", "MASTERCARD", "AMEX", "DISCOVER",
-    "AUTH", "APPROVED", "TERMINAL", "TRANS", "TRANSACTION", "CARD", "AID",
+    "AUTH", "APPROVED", "TERMINAL", "TRANS", "TRAN", "TRANSACTION", "CARD", "AID",
+    "TRAN TYPE", "SIGNATURE", "CVM", "TVR", "TSI", "REF",
 )
 
 RECEIPT_FOOTER_TERMS = (
@@ -521,6 +522,8 @@ class ReceiptRowValidator:
             reasons.append("invalid_product_name")
         if any(term in upper for term in RECEIPT_TOTAL_TERMS):
             reasons.append("receipt_level_term")
+        if re.fullmatch(r"(?:TRAN\s+)?TYPE:?\s+SALE", upper) or canonical == "TYPE SALE":
+            reasons.append("receipt_level_term")
         if any(term in upper for term in ("YOU SAVED", "TOTAL DISCOUNTS", "SAVINGS TODAY")):
             reasons.append("discount_summary_row")
         if self._near_receipt_level_term(canonical):
@@ -529,7 +532,7 @@ class ReceiptRowValidator:
             reasons.append("footer_or_address_text")
         if self._survey_or_barcode_row(upper):
             reasons.append("survey_or_barcode_numeric_row")
-        if any(token in upper for token in ("REG#", "TRN#", "CSHR", "STR#", "PHARMACY:", "STORE:")):
+        if any(token in upper for token in ("REG#", "TRN#", "CSHR", "STR#", "PHARMACY:", "STORE:", "TRAN TYPE", "SIGNATURE REQUIRED", "CVM:", "TVR", "TSI")):
             reasons.append("terminal_or_store_metadata")
         if re.search(r"\[|\]|<S_", name, flags=re.IGNORECASE):
             reasons.append("serialized_or_tagged_text")
@@ -544,6 +547,9 @@ class ReceiptRowValidator:
             reasons.append("weak_name_matches_receipt_total")
         if not short_retail_code and len(canonical.split()) == 1 and len(canonical) <= 5:
             reasons.append("short_single_token_product_name")
+        tokens = canonical.split()
+        if len(tokens) >= 2 and all(len(token) <= 3 for token in tokens):
+            reasons.append("weak_short_ocr_noise")
         score = self.score(row, reasons)
         hard_rejects = {
             "receipt_level_term",
@@ -556,6 +562,7 @@ class ReceiptRowValidator:
             "survey_or_barcode_numeric_row",
             "low_source_confidence",
             "discount_summary_row",
+            "weak_short_ocr_noise",
         }
         if "weak_name_matches_receipt_total" in reasons and "short_single_token_product_name" in reasons:
             hard_rejects.add("weak_name_matches_receipt_total")
@@ -824,6 +831,7 @@ class ReceiptRowConsolidationPipeline:
         entity_result = self.entity_engine.extract(raw_text=raw_text, lines=source_lines, ocr_blocks=ocr_blocks)
         self._merge_entity_facts(facts, entity_result)
         self._merge_line_total_facts(facts, source_lines)
+        self._sanitize_temporal_facts(facts, source_lines)
         self._sanitize_receipt_facts(facts)
         candidates = self.extractor.extract(
             donut,
@@ -857,6 +865,7 @@ class ReceiptRowConsolidationPipeline:
         consolidated = [self.clusterer.consolidate(cluster, self.validator, facts) for cluster in clusters]
         self._apply_line_discounts(consolidated, source_lines)
         consolidated, reconciliation = self.reconciler.reconcile(consolidated, facts)
+        self._reconcile_receipt_facts_with_items(facts, consolidated)
         consolidated = [{**item, "id": index + 1} for index, item in enumerate(consolidated)]
         merchant_resolution = self.merchants.resolve(
             "\n".join(source_lines) or raw_text,
@@ -1027,6 +1036,10 @@ class ReceiptRowConsolidationPipeline:
                 inferred["subtotal"] = amount
             elif "TOTAL TAX" in upper or (re.search(r"\bTAX\b", upper) and "%" not in upper and "FSA" not in upper):
                 inferred["tax"] = amount
+            elif "HARGE" in upper or "CHARGE" in upper:
+                inferred["charge"] = amount
+            elif "GATT" in upper:
+                inferred["total"] = amount
             elif re.search(r"\bTOTAL\b", upper) and "TAX" not in upper and "FSA" not in upper and "DISCOUNT" not in upper:
                 inferred["total"] = amount
             elif re.search(r"\bAMOUNT\b", upper):
@@ -1047,6 +1060,22 @@ class ReceiptRowConsolidationPipeline:
             elif not current or abs(candidate - current) > max(1.0, candidate * 0.25):
                 facts[key] = value
 
+    def _sanitize_temporal_facts(self, facts: dict[str, str], lines: list[str]) -> None:
+        date_value = _compact(facts.get("purchaseDate") or facts.get("date"))
+        if not date_value:
+            return
+        digits = re.sub(r"\D+", "", date_value)
+        if not digits:
+            return
+        matching_lines = [
+            _compact(line).upper()
+            for line in lines
+            if digits and digits in re.sub(r"\D+", "", str(line or ""))
+        ]
+        if matching_lines and all(any(term in line for term in ("RETURN", "POLICY", "THRU", "EXP", "EXPIRES")) for line in matching_lines):
+            facts["date"] = ""
+            facts["purchaseDate"] = ""
+
     def _decimal_amounts(self, line: str) -> list[str]:
         return [match.group(0).replace(",", ".").replace(":", ".") for match in re.finditer(r"\d{1,6}[.,:]\d{2}", str(line or ""))]
 
@@ -1054,6 +1083,11 @@ class ReceiptRowConsolidationPipeline:
         subtotal = _numeric_amount(facts.get("subtotal"))
         total = _numeric_amount(facts.get("total"))
         tax = _numeric_amount(facts.get("tax"))
+        charge = _numeric_amount(facts.get("charge"))
+        if total > 10000 and charge and charge < total * 0.1:
+            logger.info("Replacing implausible receipt total with payment charge total=%s charge=%s", facts.get("total"), facts.get("charge"))
+            facts["total"] = f"{charge:.2f}"
+            total = charge
         if subtotal and total:
             inferred_total = subtotal + tax
             if tax and inferred_total > total and abs(inferred_total - total) > max(1.0, inferred_total * 0.1):
@@ -1071,6 +1105,20 @@ class ReceiptRowConsolidationPipeline:
             elif "." not in str(facts.get("subtotal", "")) and abs(subtotal - total) > max(0.5, total * 0.08):
                 logger.info("Discarding no-cents subtotal that disagrees with total subtotal=%s total=%s", facts.get("subtotal"), facts.get("total"))
                 facts["subtotal"] = ""
+
+    def _reconcile_receipt_facts_with_items(self, facts: dict[str, str], items: list[dict[str, Any]]) -> None:
+        item_sum = sum(_numeric_amount(item.get("netAmount") or item.get("amount") or item.get("price")) for item in items)
+        if item_sum <= 0:
+            return
+        total = _numeric_amount(facts.get("total"))
+        subtotal = _numeric_amount(facts.get("subtotal"))
+        tax = _numeric_amount(facts.get("tax"))
+        if total > 10000 and item_sum < total * 0.1:
+            logger.info("Replacing implausible receipt total with item sum total=%s item_sum=%.2f", facts.get("total"), item_sum)
+            facts["total"] = f"{item_sum:.2f}"
+            total = item_sum
+        if not total and not subtotal and not tax and len(items) <= 3:
+            facts["total"] = f"{item_sum:.2f}"
 
     def _apply_line_discounts(self, items: list[dict[str, Any]], lines: list[str]) -> None:
         if not items or not lines:
