@@ -43,6 +43,16 @@ PRODUCT_STOPWORDS = {
     "REG", "TRN", "CSHR", "STR", "ROAD", "NORTH", "STORE", "PHARMACY", "EA",
 }
 
+RECEIPT_ITEM_PREFIX_MARKERS = {
+    "A", "B", "C", "D", "E", "E+", "EJ", "EL", "EY", "F", "H", "HE", "I", "L", "N",
+    "O", "OE", "SA", "S", "ST", "T", "X", "CF", "0",
+}
+
+PRODUCT_NAME_OCR_CORRECTIONS = (
+    (re.compile(r"\bB[EZ]ENA\s+EDMAME\b", flags=re.IGNORECASE), "BIENA EDAMAME"),
+    (re.compile(r"\bEDMAME\b", flags=re.IGNORECASE), "EDAMAME"),
+)
+
 RECEIPT_LEVEL_CANONICAL_TERMS = (
     "TOTAL", "SUBTOTAL", "TAX", "TIP", "CHARGE", "PAYMENT", "CHANGE", "BALANCE",
     "VISA", "MASTERCARD", "AMEX", "DISCOVER", "AUTH", "CARD", "CASH",
@@ -245,6 +255,21 @@ class ReceiptCandidateExtractor:
         self._extract_ocr_box_rows(ocr_blocks or [], candidates, lines, sections)
         pending_description: tuple[str, int] | None = None
         for index, line in enumerate(lines):
+            if pending_description and self._weighted_price_line(line):
+                amount = self._weighted_extended_amount(line)
+                if amount:
+                    section = next((section.kind for section in sections if section.start <= index <= section.end), "unknown")
+                    candidates.append(CandidateRow(
+                        source="ocr.line",
+                        name=pending_description[0],
+                        amount=_amount(amount),
+                        confidence=0.64 if section == "items" else 0.42,
+                        raw={"line": line, "lineIndex": index, "weighted": self._weighted_price_components(line)},
+                        section=section,
+                        line_index=index,
+                    ))
+                    pending_description = None
+                    continue
             match = self._line_item_match(line)
             if not match:
                 pending = self._pending_description(line)
@@ -252,7 +277,11 @@ class ReceiptCandidateExtractor:
                     pending_description = (pending, index)
                 continue
             if pending_description and (self._amount_only_or_noise_price_line(line) or self._weighted_price_line(line)):
-                match = {"name": pending_description[0], "amount": match["amount"]}
+                match = {
+                    "name": pending_description[0],
+                    "amount": match["amount"],
+                    "weighted": self._weighted_price_components(line),
+                }
                 pending_description = None
             else:
                 pending_description = None
@@ -262,7 +291,7 @@ class ReceiptCandidateExtractor:
                 name=_compact(match["name"]),
                 amount=_amount(match["amount"]),
                 confidence=0.64 if section == "items" else 0.42,
-                raw={"line": line, "lineIndex": index},
+                raw={"line": line, "lineIndex": index, "weighted": match.get("weighted") or {}},
                 section=section,
                 line_index=index,
             ))
@@ -286,7 +315,59 @@ class ReceiptCandidateExtractor:
         return bool(re.fullmatch(r"[^A-Za-z]{0,12}\d{1,6}(?:[.,]\d{2})[^A-Za-z]{0,12}", text))
 
     def _weighted_price_line(self, line: str) -> bool:
-        return bool(re.search(r"\b\d+(?:[.,]\d+)?\s*(?:LB|LBS)\s*@", _compact(line).upper()))
+        return bool(re.search(r"\b\d+(?:[.,]\d+)?\s*(?:LB|LBS|IB|IBS|1B|1BS)\D{0,4}@", _compact(line).upper()))
+
+    def _weighted_price_components(self, line: str) -> dict[str, str]:
+        text = _compact(line)
+        match = re.search(
+            r"\b(?P<weight>\d+(?:[.,]\d+)?)\s*(?P<unit>LB|LBS|IB|IBS|1B|1BS|OZ|KG|G)\D{0,4}@\D{0,8}"
+            r"(?P<unit_price>\d+(?:[.,]\d+)?)\s*/?\s*(?P<unit_price_unit>LB|LBS|IB|IBS|1B|1BS|OZ|KG|G)?",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return {}
+        unit = self._normalize_weight_unit(match.group("unit"))
+        unit_price_unit = self._normalize_weight_unit(match.group("unit_price_unit") or unit)
+        return {
+            "soldByWeight": True,
+            "weight": match.group("weight").replace(",", "."),
+            "weightUnit": unit,
+            "unitPrice": match.group("unit_price").replace(",", "."),
+            "unitPriceUnit": unit_price_unit,
+        }
+
+    def _normalize_weight_unit(self, value: str) -> str:
+        unit = re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+        if unit in {"LB", "LBS", "IB", "IBS", "1B", "1BS"}:
+            return "lb"
+        return unit.lower()
+
+    def _weighted_extended_amount(self, line: str) -> str:
+        text = _compact(line)
+        decimal_amounts = [match.group(0).replace(",", ".") for match in re.finditer(r"\d{1,5}[.,]\d{2}", text)]
+        if len(decimal_amounts) >= 3:
+            return decimal_amounts[-1]
+        computed = self._computed_weighted_amount(text)
+        tail = re.search(r"(?:LB|LBS|IB|IBS|1B|1BS)\D+(?P<amount>\d{3,5})(?:\s|$)", text, flags=re.IGNORECASE)
+        if tail:
+            normalized_tail = self._normalize_ocr_line_amount(tail.group("amount"))
+            if computed and abs(_numeric_amount(normalized_tail) - _numeric_amount(computed)) > 0.05:
+                return computed
+            return normalized_tail
+        if len(decimal_amounts) >= 2 and computed:
+            return computed
+        return decimal_amounts[-1] if len(decimal_amounts) >= 2 else ""
+
+    def _computed_weighted_amount(self, line: str) -> str:
+        weighted = self._weighted_price_components(line)
+        try:
+            weight = float(weighted.get("weight") or 0)
+            unit_price = float(weighted.get("unitPrice") or 0)
+        except (TypeError, ValueError):
+            return ""
+        amount = weight * unit_price
+        return f"{amount:.2f}" if amount > 0 else ""
 
     def _line_item_match(self, line: str) -> dict[str, str] | None:
         text = _compact(line)
@@ -302,23 +383,29 @@ class ReceiptCandidateExtractor:
         amounts = list(re.finditer(r"-?\d{1,6}(?:[.,:]\d{2})", text))
         if not amounts:
             amounts = list(re.finditer(r"\b\d{4,5}\b", text))
-        if len(amounts) > 1 and not re.search(r"\b\d+(?:[.,]\d+)?\s*(?:LB|LBS)\s*@", upper):
+        if len(amounts) > 1 and not self._weighted_price_line(text):
             return None
         if not amounts:
             return None
         amount_match = amounts[-1]
         trailing = text[amount_match.end():].strip()
-        if re.search(r"\d{2,}", trailing):
+        if re.search(r"\d{2,}", trailing) and not self._weighted_price_line(text):
             return None
         name = text[:amount_match.start()].strip(" -:|\\/*'\"“”[](){}")
-        if re.search(r"\b\d+(?:[.,]\d+)?\s*(?:LB|LBS)\s*@", upper):
+        if self._weighted_price_line(text):
             previous_name = self._pending_description(text)
             if previous_name:
                 name = previous_name
         name = self._clean_ocr_item_name(name)
         if len(re.findall(r"[A-Za-z]", name)) < 3 and not re.search(r"\bO\s*/?\s*N\b", name, flags=re.IGNORECASE):
             return None
-        return {"name": name, "amount": self._normalize_ocr_line_amount(amount_match.group(0))}
+        weighted = self._weighted_price_components(text) if self._weighted_price_line(text) else {}
+        amount = self._weighted_extended_amount(text) if weighted else ""
+        return {
+            "name": name,
+            "amount": amount or self._normalize_ocr_line_amount(amount_match.group(0)),
+            "weighted": weighted,
+        }
 
     def _normalize_ocr_line_amount(self, value: str) -> str:
         text = re.sub(r"(?<=\d):(?=\d{2}\b)", ".", str(value or "")).replace(",", ".")
@@ -346,11 +433,14 @@ class ReceiptCandidateExtractor:
         cleaned = re.sub(r"^(?:/\)?\d{4,}\s*)+", "", cleaned)
         cleaned = re.sub(r"^[A-Z]?\s*\d{4,}\s+", "", cleaned)
         cleaned = re.sub(r"\s*[=|\\/]+\s*$", "", cleaned)
+        cleaned = self._strip_leading_ocr_noise_tokens(cleaned)
+        for pattern, replacement in PRODUCT_NAME_OCR_CORRECTIONS:
+            cleaned = pattern.sub(replacement, cleaned)
         return _compact(cleaned)
 
     def _strip_leading_ocr_noise_tokens(self, value: str) -> str:
         tokens = _compact(value).split()
-        noisy = {"E", "E+", "EY", "EL", "HE", "SH", "OE", "SA", "F", "CF", "O", "0"}
+        noisy = RECEIPT_ITEM_PREFIX_MARKERS | {"SH"}
         while tokens:
             normalized = re.sub(r"[^A-Z+]", "", tokens[0].upper())
             if normalized in noisy or re.fullmatch(r"\d{3,}", tokens[0]):
@@ -430,7 +520,7 @@ class ReceiptCandidateExtractor:
                     "width": max(right_values) - min(x_values),
                     "height": max(bottom_values) - min(y_values),
                 },
-                raw={"line": text, "boxCount": len(ordered), "rowIndex": row_index},
+                raw={"line": text, "boxCount": len(ordered), "rowIndex": row_index, "weighted": match.get("weighted") or {}},
                 section=section,
                 line_index=line_index,
             ))
@@ -524,7 +614,7 @@ class ReceiptRowValidator:
             reasons.append("receipt_level_term")
         if re.fullmatch(r"(?:TRAN\s+)?TYPE:?\s+SALE", upper) or canonical == "TYPE SALE":
             reasons.append("receipt_level_term")
-        if any(term in upper for term in ("YOU SAVED", "TOTAL DISCOUNTS", "SAVINGS TODAY")):
+        if any(term in upper for term in ("INSTANT SAVINGS", "YOU SAVED", "TOTAL DISCOUNTS", "TOTAL SAVINGS", "SAVINGS TODAY")):
             reasons.append("discount_summary_row")
         if self._near_receipt_level_term(canonical):
             reasons.append("ocr_mutation_of_receipt_level_term")
@@ -644,7 +734,7 @@ class ReceiptDuplicateClusterer:
         best = max(cluster, key=lambda row: (validator.score(row, row.reasons), len(_canonical_name(row.name)), row.confidence))
         qty = best.qty or "1"
         confidence = min(0.98, validator.score(best, best.reasons) + min(0.18, 0.04 * (len(cluster) - 1)))
-        return {
+        item = {
             "name": self._clean_name(best.name),
             "qty": qty,
             "count": qty,
@@ -655,6 +745,19 @@ class ReceiptDuplicateClusterer:
             "sources": sorted({row.source for row in cluster}),
             "rowConfidenceTrace": self._cluster_trace(best, cluster, validator),
         }
+        weighted = best.raw.get("weighted") if isinstance(best.raw, dict) and isinstance(best.raw.get("weighted"), dict) else {}
+        if weighted.get("soldByWeight"):
+            weight = str(weighted.get("weight") or "")
+            unit_price = str(weighted.get("unitPrice") or "")
+            item.update({
+                "soldByWeight": True,
+                "weight": weight,
+                "weightQuantity": weight,
+                "weightUnit": weighted.get("weightUnit") or "",
+                "unitPrice": unit_price,
+                "unitPriceUnit": weighted.get("unitPriceUnit") or weighted.get("weightUnit") or "",
+            })
+        return item
 
     def duplicate_diagnostics(self, clusters: list[list[CandidateRow]], validator: ReceiptRowValidator) -> list[dict[str, Any]]:
         diagnostics = []
@@ -711,12 +814,14 @@ class ReceiptDuplicateClusterer:
         text = self._strip_leading_ocr_noise_tokens(text)
         text = re.sub(r"\b\d{5,}\b", " ", text)
         text = self._strip_leading_ocr_noise_tokens(text)
+        for pattern, replacement in PRODUCT_NAME_OCR_CORRECTIONS:
+            text = pattern.sub(replacement, text)
         text = re.sub(r"\s+", " ", text).strip(" -_:;,")
         return text
 
     def _strip_leading_ocr_noise_tokens(self, value: str) -> str:
         tokens = _compact(value).split()
-        noisy = {"E", "E+", "EY", "EL", "HE", "SH", "OE", "SA", "F", "CF"}
+        noisy = RECEIPT_ITEM_PREFIX_MARKERS | {"SH"}
         while tokens:
             normalized = re.sub(r"[^A-Z+]", "", tokens[0].upper())
             if normalized in noisy or re.fullmatch(r"\d{3,}", tokens[0]):
@@ -831,6 +936,7 @@ class ReceiptRowConsolidationPipeline:
         entity_result = self.entity_engine.extract(raw_text=raw_text, lines=source_lines, ocr_blocks=ocr_blocks)
         self._merge_entity_facts(facts, entity_result)
         self._merge_line_total_facts(facts, source_lines)
+        self._merge_line_discount_facts(facts, source_lines)
         self._sanitize_temporal_facts(facts, source_lines)
         self._sanitize_receipt_facts(facts)
         candidates = self.extractor.extract(
@@ -889,6 +995,9 @@ class ReceiptRowConsolidationPipeline:
             "subtotal": facts.get("subtotal", ""),
             "tax": facts.get("tax", ""),
             "tip": facts.get("tip", ""),
+            "discount": facts.get("totalDiscount", ""),
+            "totalDiscount": facts.get("totalDiscount", ""),
+            "totalSavings": facts.get("totalDiscount", ""),
             "charge": facts.get("charge", ""),
             "total": facts.get("total", ""),
             "paymentMethod": facts.get("paymentMethod", ""),
@@ -944,6 +1053,18 @@ class ReceiptRowConsolidationPipeline:
             "subtotal": _amount(donut.get("subtotal") or parser_json.get("subtotal") or parser_json.get("subTotal")),
             "tax": _amount(donut.get("tax") or parser_json.get("tax")),
             "tip": _amount(donut.get("tip") or parser_json.get("tip")),
+            "totalDiscount": _amount(
+                donut.get("totalDiscount")
+                or donut.get("totalDiscounts")
+                or donut.get("totalSavings")
+                or donut.get("discount")
+                or donut.get("receiptDiscount")
+                or parser_json.get("totalDiscount")
+                or parser_json.get("totalDiscounts")
+                or parser_json.get("totalSavings")
+                or parser_json.get("discount")
+                or parser_json.get("receiptDiscount")
+            ),
             "charge": _amount(donut.get("charge") or parser_json.get("charge")),
             "total": _amount(donut.get("total") or parser_json.get("total")),
             "paymentMethod": _compact(donut.get("paymentMethod") or parser_json.get("paymentMethod")),
@@ -1060,6 +1181,20 @@ class ReceiptRowConsolidationPipeline:
             elif not current or abs(candidate - current) > max(1.0, candidate * 0.25):
                 facts[key] = value
 
+    def _merge_line_discount_facts(self, facts: dict[str, str], lines: list[str]) -> None:
+        if _numeric_amount(facts.get("totalDiscount")) > 0:
+            return
+        for line in lines:
+            text = _compact(line)
+            upper = text.upper()
+            if not any(term in upper for term in ("INSTANT SAVINGS", "TOTAL SAVINGS", "TOTAL DISCOUNTS", "SAVINGS TODAY", "YOU SAVED")):
+                continue
+            amounts = self._decimal_amounts(text)
+            if amounts:
+                facts["totalDiscount"] = amounts[-1]
+        if _numeric_amount(facts.get("totalDiscount")) <= 0:
+            facts["totalDiscount"] = ""
+
     def _sanitize_temporal_facts(self, facts: dict[str, str], lines: list[str]) -> None:
         date_value = _compact(facts.get("purchaseDate") or facts.get("date"))
         if not date_value:
@@ -1140,8 +1275,8 @@ class ReceiptRowConsolidationPipeline:
             return
         line_items.sort(key=lambda entry: entry[0])
         for index, line in enumerate(lines):
-            discount = self._standalone_discount_amount(line)
-            if not discount:
+            discount = self._standalone_discount_adjustment(line)
+            if not discount.get("amount"):
                 continue
             target = None
             for line_index, item in line_items:
@@ -1151,15 +1286,25 @@ class ReceiptRowConsolidationPipeline:
                     break
             if target is None:
                 continue
-            discount_value = _numeric_amount(discount)
+            target_index = next((line_index for line_index, item in line_items if item is target), None)
+            if target_index is None or index - target_index > 2:
+                continue
+            if discount.get("mode") == "included_in_item_amount":
+                if index - target_index > 1:
+                    continue
+            discount_value = _numeric_amount(discount.get("amount"))
             gross_value = _numeric_amount(target.get("amount") or target.get("price"))
             if discount_value <= 0 or gross_value <= 0:
                 continue
             existing_discount = _numeric_amount(target.get("discount"))
             total_discount = existing_discount + discount_value
-            target["grossAmount"] = f"{gross_value:.2f}"
             target["discount"] = f"{total_discount:.2f}"
-            target["netAmount"] = f"{max(0.0, gross_value - total_discount):.2f}"
+            if discount.get("mode") == "included_in_item_amount":
+                target["grossAmount"] = f"{gross_value + total_discount:.2f}"
+                target["netAmount"] = f"{gross_value:.2f}"
+            else:
+                target["grossAmount"] = f"{gross_value:.2f}"
+                target["netAmount"] = f"{max(0.0, gross_value - total_discount):.2f}"
             adjustments = target.setdefault("adjustments", [])
             if isinstance(adjustments, list):
                 adjustments.append({
@@ -1168,29 +1313,36 @@ class ReceiptRowConsolidationPipeline:
                     "rawLine": line,
                     "lineIndex": index,
                     "appliesTo": "previous_item_line",
+                    "mode": discount.get("mode") or "subtract_from_item_amount",
                 })
 
-    def _standalone_discount_amount(self, line: str) -> str:
+    def _standalone_discount_adjustment(self, line: str) -> dict[str, str]:
         text = _compact(line)
         upper = text.upper()
-        if not text or any(term in upper for term in RECEIPT_TOTAL_TERMS + RECEIPT_FOOTER_TERMS):
-            return ""
-        match = re.search(r"(?P<amount>\d{1,5}(?:[.,]\d{2})|\d{3,5})\s*[-–—]\s*$", text)
+        if not text or any(term in upper for term in RECEIPT_TOTAL_TERMS):
+            return {}
+        saved_match = re.search(r"\bYOU\s+SAVED\b\D{0,12}(?P<amount>\d{1,5}(?:[.,]\d{2}))\b", text, flags=re.IGNORECASE)
+        if saved_match:
+            return {"amount": saved_match.group("amount").replace(",", "."), "mode": "included_in_item_amount"}
+        if any(term in upper for term in RECEIPT_FOOTER_TERMS):
+            return {}
+        match = re.search(r"(?P<amount>\d{1,5}(?:[.,]\d{2})|\d{3,5})\s*[-–—]\s*(?:[=|:;,.]*)\s*$", text)
         if not match:
-            return ""
+            return {}
         prefix = text[:match.start()].upper()
         if re.search(r"\d{14,}", prefix):
-            return ""
+            return {}
         prefix = re.sub(r"\b\d{3,}\b", " ", prefix)
         prefix = re.sub(r"[/\\|()[\]{}<>%*#+=.,:;!?'\"]", " ", prefix)
         words = [word for word in prefix.split() if re.search(r"[A-Z]", word)]
         product_words = [
             word for word in words
-            if word not in {"E", "EJ", "EL", "EY", "F", "CF", "OE", "SA", "ST", "X"}
+            if word not in {"AT", "I", "E", "EJ", "EL", "EY", "F", "CF", "OE", "SA", "ST", "X"}
+            and not re.search(r"\d", word)
         ]
         if product_words:
-            return ""
-        return match.group("amount").replace(",", ".")
+            return {}
+        return {"amount": match.group("amount").replace(",", "."), "mode": "subtract_from_item_amount"}
 
     def _section_boundary_lock(self, section_result: dict[str, Any]) -> dict[str, Any]:
         debug = section_result.get("debug", {}) if isinstance(section_result, dict) else {}

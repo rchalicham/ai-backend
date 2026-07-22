@@ -60,9 +60,8 @@ Relevant backend routes:
 - `POST /receipt/document-understanding`
 - `POST /receipt/document-understanding/upload`
 - `POST /receipt/image/isolate`
-- legacy compatibility: `POST /imageTranslation/`, `POST /pdf/`
 
-The main production path is `/receipt/document-understanding`, now delegated to `ReceiptAgentOrchestrator`.
+The production path is `/receipt/document-understanding`, delegated to `ReceiptAgentOrchestrator`.
 
 ### ReceiptAgentOrchestrator
 

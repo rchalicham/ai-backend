@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -11,6 +12,7 @@ class ReceiptOcrResult:
     raw_text: str = ""
     lines: list[str] = field(default_factory=list)
     ocr_blocks: list[dict[str, Any]] = field(default_factory=list)
+    variants: list[dict[str, Any]] = field(default_factory=list)
     warning: str = ""
     engine: str = "tesseract"
 
@@ -21,6 +23,7 @@ class ReceiptOcrResult:
             "rawText": self.raw_text,
             "rawLines": self.lines,
             "ocrBlocks": self.ocr_blocks,
+            "ocrVariants": self.variants,
             "warning": self.warning,
         }
 
@@ -43,38 +46,137 @@ class ReceiptOcrService:
             image = cv2.imdecode(data, cv2.IMREAD_COLOR)
             if image is None:
                 return ReceiptOcrResult(available=False, warning="unable_to_decode_image")
-            candidates = [
-                ("prepared_psm6", self._prepare_for_ocr(cv2, image), "--oem 3 --psm 6 -c preserve_interword_spaces=1"),
-                ("gray_psm4", self._upscale_for_ocr(cv2, cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)), "--oem 3 --psm 4 -c preserve_interword_spaces=1"),
-                ("gray_psm6", self._upscale_for_ocr(cv2, cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)), "--oem 3 --psm 6 -c preserve_interword_spaces=1"),
-            ]
-            best_blocks: list[dict[str, Any]] = []
-            best_lines: list[str] = []
-            best_score = -1.0
-            best_engine = "tesseract"
-            for name, candidate_image, config in candidates:
+            candidates = self._ocr_candidates(cv2, image)
+            attempts: list[dict[str, Any]] = []
+            for name, candidate_image, psm in candidates:
+                config = f"--oem 3 --psm {psm} -c preserve_interword_spaces=1"
                 ocr_data = pytesseract.image_to_data(candidate_image, output_type=pytesseract.Output.DICT, config=config)
                 blocks = self._blocks_from_tesseract(ocr_data)
                 lines = self._lines_from_blocks(blocks)
                 score = self._ocr_line_score(lines)
-                if score > best_score:
-                    best_score = score
-                    best_blocks = blocks
-                    best_lines = lines
-                    best_engine = f"tesseract:{name}"
-            blocks = best_blocks
-            lines = best_lines
+                attempts.append({
+                    "name": name,
+                    "psm": psm,
+                    "image": candidate_image,
+                    "config": config,
+                    "score": score,
+                    "blocks": blocks,
+                    "lines": lines,
+                })
+            attempts.sort(key=lambda attempt: attempt["score"], reverse=True)
+            for attempt in attempts[: self._string_variant_count()]:
+                string_text = pytesseract.image_to_string(attempt["image"], config=attempt["config"])
+                string_lines = [self._normalize_line(line) for line in string_text.splitlines() if self._normalize_line(line)]
+                attempt["lines"] = self._merge_line_sets(attempt["lines"], string_lines)
+                attempt["score"] = self._ocr_line_score(attempt["lines"])
+            attempts.sort(key=lambda attempt: attempt["score"], reverse=True)
+            best = attempts[0] if attempts else {"name": "none", "score": 0.0, "blocks": [], "lines": []}
+            lines = self._merge_ocr_lines(attempts[:6])
+            best_lines = best.get("lines") or []
+            if self._ocr_line_score(lines) < float(best.get("score") or 0.0) * 0.75:
+                lines = best_lines
+            blocks = best.get("blocks") or []
             raw_text = "\n".join(lines)
             return ReceiptOcrResult(
                 available=bool(raw_text.strip()),
                 raw_text=raw_text,
                 lines=lines,
                 ocr_blocks=blocks,
+                variants=[
+                    {
+                        "engine": "tesseract",
+                        "variant": attempt["name"],
+                        "psm": attempt["psm"],
+                        "score": round(float(attempt["score"] or 0.0), 3),
+                        "lines": attempt["lines"][:120],
+                    }
+                    for attempt in attempts[:6]
+                ],
                 warning="" if raw_text.strip() else "no_text_detected",
-                engine=best_engine,
+                engine=f"tesseract:{best.get('name', 'none')}",
             )
         except Exception as exc:
             return ReceiptOcrResult(available=False, warning=f"ocr_failed:{exc.__class__.__name__}")
+
+    def _string_variant_count(self) -> int:
+        try:
+            return max(0, min(6, int(os.getenv("RECEIPT_OCR_STRING_VARIANTS", "3"))))
+        except ValueError:
+            return 3
+
+    def _ocr_candidates(self, cv2: Any, image: Any) -> list[tuple[str, Any, int]]:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        prepared = self._prepare_for_ocr(cv2, image)
+        upscaled = self._upscale_for_ocr(cv2, gray)
+        clahe = cv2.createCLAHE(clipLimit=2.8, tileGridSize=(8, 8)).apply(upscaled)
+        background = cv2.medianBlur(upscaled, 31)
+        flattened = cv2.divide(upscaled, background, scale=255)
+        threshold = cv2.adaptiveThreshold(
+            flattened,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            41,
+            9,
+        )
+        candidates: list[tuple[str, Any, int]] = []
+        for name, candidate in (
+            ("prepared", prepared),
+            ("gray", upscaled),
+            ("flattened", flattened),
+            ("adaptive_threshold", threshold),
+        ):
+            for psm in (4, 6):
+                candidates.append((name, candidate, psm))
+        candidates.append(("gray", upscaled, 11))
+        candidates.append(("flattened", flattened, 11))
+        return candidates
+
+    def _merge_ocr_lines(self, attempts: list[dict[str, Any]], max_lines: int = 180) -> list[str]:
+        selected: list[str] = []
+        seen: set[str] = set()
+        for attempt in attempts:
+            for raw_line in attempt.get("lines") or []:
+                line = self._normalize_line(raw_line)
+                if not line:
+                    continue
+                key = re.sub(r"[^a-z0-9.]+", "", line.lower())
+                if not key or key in seen:
+                    continue
+                if self._line_quality_score(line) < 4:
+                    continue
+                seen.add(key)
+                selected.append(line)
+                if len(selected) >= max_lines:
+                    return selected
+        return selected
+
+    def _merge_line_sets(self, *line_sets: list[str]) -> list[str]:
+        selected: list[str] = []
+        seen: set[str] = set()
+        for lines in line_sets:
+            for raw_line in lines:
+                line = self._normalize_line(raw_line)
+                key = re.sub(r"[^a-z0-9.]+", "", line.lower())
+                if not line or not key or key in seen:
+                    continue
+                seen.add(key)
+                selected.append(line)
+        return selected
+
+    def _normalize_line(self, line: Any) -> str:
+        return re.sub(r"\s+", " ", str(line or "").replace("|", "I")).strip()
+
+    def _line_quality_score(self, line: str) -> float:
+        normalized = self._normalize_line(line)
+        if not normalized:
+            return 0.0
+        alpha = sum(char.isalpha() for char in normalized)
+        digits = sum(char.isdigit() for char in normalized)
+        price = 18 if re.search(r"\$?\d+[\.,]\d{2}", normalized) else 0
+        date = 14 if re.search(r"\d{1,2}/\d{1,2}/\d{2,4}", normalized) else 0
+        noise_penalty = len(re.findall(r"[^A-Za-z0-9\s$.,:/#&()'@+-]", normalized)) * 4
+        return len(normalized) + alpha + digits + price + date - noise_penalty
 
     def _prepare_for_ocr(self, cv2: Any, image: Any) -> Any:
         height, width = image.shape[:2]

@@ -210,6 +210,71 @@ def test_merchant_confidence_rejects_noisy_centered_header_over_domain():
     assert all(candidate["merchant"] != "eat Ma 15 Ue SEIN" for candidate in merchant_pass["candidates"])
 
 
+def test_merchant_confidence_recovers_cvs_from_return_policy_ocr_fragments():
+    semantic = {
+        "merchant": "Wore NE AS Ure RAE",
+        "storeName": "Wore NE AS Ure RAE",
+        "merchantConfidenceTrace": {
+            "rawMerchant": "Wore NE AS Ure RAE",
+            "confidence": 0.58,
+            "source": "raw_ocr_preserved",
+            "preservedRawOcr": True,
+        },
+        "reconstructedLines": [
+            {"index": 0, "text": "wore NE AS Ure RAE", "confidence": 0.9, "bbox": {"x": 0, "y": 24, "width": 690, "height": 68}},
+            {"index": 1, "text": "4140 ROAD 101 NORTH, PLYMOUTH, MN", "confidence": 0.9, "bbox": {"x": 80, "y": 130, "width": 550, "height": 22}},
+            {"index": 2, "text": "PHARMACY: 9478-4612 STORE:", "confidence": 0.92, "bbox": {"x": 362, "y": 189, "width": 513, "height": 48}},
+        ],
+        "sectionExtraction": {
+            "visualHierarchy": {
+                "lines": [
+                    {"lineIndex": 2, "visualImportance": 0.96, "zone": "merchant_zone"},
+                ]
+            }
+        },
+        "confidence": {"merchant": 0.58},
+    }
+
+    parser_json = {
+        "documentUnderstanding": {
+            "ocrFallback": {
+                "rawLines": [
+                    "with receipt, subject, to",
+                    "ol {cus",
+                    "VS Return Policu., thru",
+                ]
+            }
+        }
+    }
+
+    reconciled = _agent()._reconcile_merchant_confidence(semantic, parser_json=parser_json)
+
+    assert reconciled["merchant"] == "CVS"
+    merchant_pass = reconciled["receiptAgentPasses"]["merchantConfidence"]
+    assert merchant_pass["source"] == "return_policy_merchant_clue"
+    assert any(candidate["source"] == "return_policy_merchant_clue" for candidate in merchant_pass["candidates"])
+    assert all(candidate["merchant"] != "- :" for candidate in merchant_pass["candidates"])
+
+
+def test_merchant_confidence_uses_generic_return_policy_named_merchant():
+    semantic = {
+        "merchant": "Official Rules",
+        "storeName": "Official Rules",
+        "merchantConfidenceTrace": {"rawMerchant": "", "confidence": 0.52, "source": "normalized_low_confidence"},
+        "reconstructedLines": [
+            {"index": 0, "text": "THANK YOU", "confidence": 0.9, "bbox": {"x": 20, "y": 20, "width": 160, "height": 16}},
+            {"index": 1, "text": "Returns accepted under Bright Market return policy", "confidence": 0.94, "bbox": {"x": 20, "y": 250, "width": 440, "height": 16}},
+        ],
+        "confidence": {"merchant": 0.52},
+    }
+
+    reconciled = _agent()._reconcile_merchant_confidence(semantic, parser_json={})
+
+    assert reconciled["merchant"] == "Bright Market"
+    merchant_pass = reconciled["receiptAgentPasses"]["merchantConfidence"]
+    assert merchant_pass["source"] == "return_policy_merchant_clue"
+
+
 def test_merchant_confidence_penalizes_disclaimer_and_preserves_raw_ocr_when_uncertain():
     semantic = {
         "merchant": "Official Rules",

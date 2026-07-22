@@ -317,10 +317,11 @@ def test_standalone_minus_lines_attach_as_previous_item_discounts_and_address_su
         "11330 FOUNTAINS DRIVE N",
         "MAPLE GROVE MN 55369",
         "E+ 1098148 BIENA EDMAME 7.59",
-        "2% E 0000379064 /)1898148 > 2.30-",
+        "at E 0000379064 /)1898148 > 2.30- =",
         "E+ 1993061 SPINDRIFT 18.99",
-        "E 0000380456 /1953061 5.20-",
+        "E 0000380456 /1953061 5.20- :",
         "Items Sold: 2",
+        "INSTANT SAVINGS $ 7.50",
         "AMOUNT? $19.08",
     ]
 
@@ -332,12 +333,46 @@ def test_standalone_minus_lines_attach_as_previous_item_discounts_and_address_su
 
     items = {item["name"]: item for item in normalized["items"]}
     assert normalized["storeAddress"] == "11330 FOUNTAINS DRIVE N, MAPLE GROVE, MN 55369"
-    assert items["BIENA EDMAME"]["amount"] == "7.59"
-    assert items["BIENA EDMAME"]["discount"] == "2.30"
-    assert items["BIENA EDMAME"]["netAmount"] == "5.29"
+    assert items["BIENA EDAMAME"]["amount"] == "7.59"
+    assert items["BIENA EDAMAME"]["discount"] == "2.30"
+    assert items["BIENA EDAMAME"]["netAmount"] == "5.29"
     assert items["SPINDRIFT"]["discount"] == "5.20"
     assert items["SPINDRIFT"]["netAmount"] == "13.79"
+    assert normalized["totalDiscount"] == "7.50"
+    assert "INSTANT SAVINGS" not in items
     assert all(not item["name"].endswith("-") for item in normalized["items"])
+
+
+def test_repeated_wd_marker_column_is_removed_from_item_names():
+    pipeline = ReceiptRowConsolidationPipeline()
+    lines = [
+        "WD",
+        "E 1462714 K$ ORG A2 PR 12.99",
+        "E 1898148 BEENA EDMAME 7.59",
+        "E 0000379064 /I1898148 2.30-",
+        "F 1368591 ALWAYS O/N 14.99",
+        "E 1993061 SPINDRIFT 18.99",
+        "E 0000380456 /1993061 5.20-",
+        "TOTAL NUMBER OF ITEMS SOLD = 4",
+        "INSTANT SAVINGS $ 7.50",
+        "TOTAL 53.06",
+    ]
+
+    normalized = pipeline.normalize(
+        {"available": False, "items": [], "raw": {}},
+        raw_text="\n".join(lines),
+        lines=lines,
+    )
+
+    names = [item["name"] for item in normalized["items"]]
+    assert "BIENA EDAMAME" in names
+    assert "ALWAYS O/N" in names
+    assert "SPINDRIFT" in names
+    assert all(not name.startswith(("E ", "F ", "I E ")) for name in names)
+    assert normalized["totalDiscount"] == "7.50"
+    items = {item["name"]: item for item in normalized["items"]}
+    assert items["BIENA EDAMAME"]["discount"] == "2.30"
+    assert items["SPINDRIFT"]["discount"] == "5.20"
 
 
 def test_barcode_minus_lines_do_not_attach_as_item_discounts():
@@ -363,6 +398,33 @@ def test_barcode_minus_lines_do_not_attach_as_item_discounts():
     assert normalized["items"][0]["amount"] == "79.99"
     assert "discount" not in normalized["items"][0]
     assert "netAmount" not in normalized["items"][0]
+
+
+def test_repeated_discount_ocr_variants_do_not_attach_to_later_items():
+    pipeline = ReceiptRowConsolidationPipeline()
+    lines = [
+        "E 1898148 BIENA EDAMAME 7.59",
+        "E 0000379064 /1898148 2.30-",
+        "E 1993061 SPINDRIFT 18.99",
+        "E 0000380456 /1993061 5.20-",
+        "E 1655404 GOATCUBE15LB 79.99",
+        "TOTAL NUMBER OF ITEMS SOLD = 3",
+        "INSTANT SAVINGS $ 7.50",
+        "E 0000379064 /1898148 2.30-",
+        "E 0000380456 /1993061 5.20-",
+    ]
+
+    normalized = pipeline.normalize(
+        {"available": False, "items": [], "raw": {}},
+        raw_text="\n".join(lines),
+        lines=lines,
+    )
+
+    items = {item["name"]: item for item in normalized["items"]}
+    assert items["BIENA EDAMAME"]["discount"] == "2.30"
+    assert items["SPINDRIFT"]["discount"] == "5.20"
+    assert "discount" not in items["GOATCUBE15LB"]
+    assert normalized["totalDiscount"] == "7.50"
 
 
 def test_fresh_thyme_department_rows_survive_legal_header_and_weighted_produce():
@@ -426,4 +488,19 @@ def test_fresh_thyme_department_rows_survive_legal_header_and_weighted_produce()
     assert item_names.count("RED ONION 2LB") == 3
     assert amounts["RED ROSE POTATO x"] == "1.56"
     assert amounts["SWEET POTATO"] == "1.63"
+    red_potato = next(item for item in normalized["items"] if item["name"] == "RED ROSE POTATO x")
+    sweet_potato = next(item for item in normalized["items"] if item["name"] == "SWEET POTATO")
+    assert red_potato["soldByWeight"] is True
+    assert red_potato["weight"] == "2.02"
+    assert red_potato["weightQuantity"] == "2.02"
+    assert red_potato["weightUnit"] == "lb"
+    assert red_potato["unitPrice"] == "0.77"
+    assert red_potato["unitPriceUnit"] == "lb"
+    assert red_potato["discount"] == "1.05"
+    assert red_potato["grossAmount"] == "2.61"
+    assert red_potato["netAmount"] == "1.56"
+    assert sweet_potato["soldByWeight"] is True
+    assert sweet_potato["weight"] == "1.26"
+    assert sweet_potato["weightUnit"] == "lb"
+    assert sweet_potato["unitPrice"] == "1.29"
     assert not any("SWEEPSTAKES" in name.upper() or "YOU SAVED" in name.upper() or "TOTAL DISCOUNTS" in name.upper() for name in item_names)

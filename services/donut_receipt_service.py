@@ -341,7 +341,8 @@ class DonutReceiptService:
         ocr_blocks: list[dict[str, Any]] | None = None,
         parser_json: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        if not donut_json.get("available"):
+        has_ocr_text = bool(str(raw_text or "").strip() or any(str(line).strip() for line in (lines or [])) or ocr_blocks)
+        if not donut_json.get("available") and not has_ocr_text:
             return donut_json
         return self.row_consolidation.normalize(
             donut=donut_json,

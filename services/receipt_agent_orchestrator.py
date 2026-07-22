@@ -158,12 +158,13 @@ class ReceiptAgentOrchestrator:
         if ocr_fallback:
             donut_json["ocrFallback"] = ocr_fallback
 
+        semantic_ocr_variants = ocr_variants or ocr_fallback.get("ocrVariants") or []
         semantic_parser_json = self._semantic_parser_json(parser_json, donut_json)
         semantic = self.llm_service.receipt_intelligence.to_structured_json(
             raw_text=next_raw_text,
             lines=next_lines,
             parser_json=semantic_parser_json,
-            ocr_variants=ocr_variants,
+            ocr_variants=semantic_ocr_variants,
             ocr_blocks=next_blocks,
             ocr_engine=ocr_engine or source.get("strategy") or "receipt-agent",
         )
@@ -178,7 +179,7 @@ class ReceiptAgentOrchestrator:
                 ocr_blocks=next_blocks,
                 parser_json=semantic_parser_json,
                 ocr_engine=ocr_engine or source.get("strategy") or "receipt-agent",
-                ocr_variants=ocr_variants,
+                ocr_variants=semantic_ocr_variants,
             )
             llama = self._reconcile_llama_merchant_confidence(llama, semantic)
             llama = self._reconcile_llama_item_candidates(llama)
@@ -199,7 +200,7 @@ class ReceiptAgentOrchestrator:
         )
 
     def _use_ocr_first_attempt(self, source: dict[str, Any], run_llama: bool) -> bool:
-        if run_llama or not self.ocr_first_reprocess:
+        if not self.ocr_first_reprocess:
             return False
         return str(source.get("strategy") or "") in {"isolate_receipt_then_ocr", "central_receipt_crop_ocr"}
 
@@ -304,7 +305,7 @@ class ReceiptAgentOrchestrator:
             return []
 
     def _semantic_parser_json(self, parser_json: dict[str, Any], donut_json: dict[str, Any]) -> dict[str, Any]:
-        if not donut_json.get("available"):
+        if not donut_json.get("available") and not donut_json.get("items"):
             return {**parser_json, "documentUnderstanding": donut_json}
         return {
             **parser_json,
@@ -315,6 +316,9 @@ class ReceiptAgentOrchestrator:
             "items": donut_json.get("items", []) or parser_json.get("items", []),
             "subtotal": donut_json.get("subtotal", "") or parser_json.get("subtotal", ""),
             "tax": donut_json.get("tax", "") or parser_json.get("tax", ""),
+            "discount": donut_json.get("discount", "") or parser_json.get("discount", ""),
+            "totalDiscount": donut_json.get("totalDiscount", "") or parser_json.get("totalDiscount", ""),
+            "totalSavings": donut_json.get("totalSavings", "") or parser_json.get("totalSavings", ""),
             "total": donut_json.get("total", "") or parser_json.get("total", ""),
             "logoCandidates": donut_json.get("logoCandidates", []),
             "visualIdentity": donut_json.get("visualIdentity", {}),
@@ -342,13 +346,17 @@ class ReceiptAgentOrchestrator:
         actual_count = reconciliation.get("itemCountActual")
         count_matched = bool(target_count and actual_count == target_count and len(consolidated_items) == target_count)
         arithmetic_matched = bool(reconciliation.get("matched"))
+        consolidated_has_discount = bool(donut_json.get("totalDiscount") or donut_json.get("discount") or any(
+            isinstance(item, dict) and item.get("discount")
+            for item in consolidated_items
+        ))
         semantic_has_receipt_level_row = any(
-            re.search(r"\b(?:TOTAL|SUBTOTAL|TAX|AMOUNT|VISA|AMEX|AMERICAN\s+EXPRESS|MASTERCARD|DISCOVER|CHANGE)\b", str(item.get("name") or ""), flags=re.IGNORECASE)
+            re.search(r"\b(?:TOTAL|SUBTOTAL|TAX|AMOUNT|VISA|AMEX|AMERICAN\s+EXPRESS|MASTERCARD|DISCOVER|CHANGE|SAVINGS|DISCOUNT)\b", str(item.get("name") or ""), flags=re.IGNORECASE)
             for item in semantic_items
             if isinstance(item, dict)
         )
         materially_better_count = len(consolidated_items) >= max(len(semantic_items) + 3, len(semantic_items) * 2)
-        if not (arithmetic_matched or count_matched or semantic_has_receipt_level_row or materially_better_count):
+        if not (arithmetic_matched or count_matched or consolidated_has_discount or semantic_has_receipt_level_row or materially_better_count):
             return semantic
         semantic["items"] = [
             {
@@ -359,13 +367,13 @@ class ReceiptAgentOrchestrator:
             for index, item in enumerate(consolidated_items)
             if isinstance(item, dict)
         ]
-        for key in ("subtotal", "tax", "tip", "total", "cardUsed", "cardLast4", "paymentMethod", "address", "storeAddress", "phone"):
+        for key in ("subtotal", "tax", "tip", "discount", "totalDiscount", "totalSavings", "total", "cardUsed", "cardLast4", "paymentMethod", "address", "storeAddress", "phone"):
             value = donut_json.get(key)
             if value not in (None, ""):
                 semantic[key] = value
         facts = semantic.setdefault("facts", {})
         if isinstance(facts, dict):
-            for key in ("subtotal", "tax", "tip", "total", "cardUsed", "cardLast4", "paymentMethod", "address", "storeAddress", "phone"):
+            for key in ("subtotal", "tax", "tip", "discount", "totalDiscount", "totalSavings", "total", "cardUsed", "cardLast4", "paymentMethod", "address", "storeAddress", "phone"):
                 value = donut_json.get(key)
                 if value not in (None, ""):
                     facts[key] = value
@@ -502,7 +510,8 @@ class ReceiptAgentOrchestrator:
     def _merchant_candidates(self, semantic: dict[str, Any], parser_json: dict[str, Any], current: str) -> list[dict[str, Any]]:
         candidates: list[dict[str, Any]] = []
         text_lines = self._merchant_text_lines(semantic)
-        for domain, merchant, line_index in self._domain_merchant_candidates(text_lines, parser_json):
+        evidence_lines = [*text_lines, *self._merchant_parser_text_lines(parser_json, start_index=len(text_lines))]
+        for domain, merchant, line_index in self._domain_merchant_candidates(evidence_lines, parser_json):
             candidates.append({
                 "merchant": merchant,
                 "confidence": 0.98,
@@ -511,6 +520,8 @@ class ReceiptAgentOrchestrator:
                 "lineIndex": line_index,
                 "evidence": domain,
             })
+        for candidate in self._return_policy_merchant_candidates(evidence_lines):
+            candidates.append(candidate)
         for candidate in self._visual_header_merchant_candidates(semantic):
             candidates.append(candidate)
         trace = semantic.get("merchantConfidenceTrace") if isinstance(semantic.get("merchantConfidenceTrace"), dict) else {}
@@ -532,6 +543,8 @@ class ReceiptAgentOrchestrator:
         if source_text == "domain_visual_fuzzy_consensus":
             return 4
         if source_text == "domain_name":
+            return 3
+        if source_text == "return_policy_merchant_clue":
             return 3
         if source_text.startswith("visual_hierarchy"):
             return 2
@@ -556,6 +569,41 @@ class ReceiptAgentOrchestrator:
                         lines.append({"index": index + offset, "text": text, "bbox": {}, "confidence": self._confidence_value(block.get("confidence", 0.0))})
         return [line for line in lines if line["text"].strip()]
 
+    def _merchant_parser_text_lines(self, parser_json: dict[str, Any], start_index: int = 0) -> list[dict[str, Any]]:
+        if not isinstance(parser_json, dict):
+            return []
+        documents: list[dict[str, Any]] = []
+        document_understanding = parser_json.get("documentUnderstanding")
+        if isinstance(document_understanding, dict):
+            documents.append(document_understanding)
+            ocr_fallback = document_understanding.get("ocrFallback")
+            if isinstance(ocr_fallback, dict):
+                documents.append(ocr_fallback)
+        for key in ("ocrFallback", "documentUnderstanding"):
+            value = parser_json.get(key)
+            if isinstance(value, dict) and value not in documents:
+                documents.append(value)
+        output: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for document in documents:
+            raw_lines = document.get("rawLines")
+            if isinstance(raw_lines, list):
+                for text in raw_lines:
+                    cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
+                    key = cleaned.upper()
+                    if cleaned and key not in seen:
+                        seen.add(key)
+                        output.append({"index": start_index + len(output), "text": cleaned, "bbox": {}, "confidence": 0.68})
+            raw_text = str(document.get("rawText") or "")
+            if raw_text:
+                for text in raw_text.splitlines():
+                    cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
+                    key = cleaned.upper()
+                    if cleaned and key not in seen:
+                        seen.add(key)
+                        output.append({"index": start_index + len(output), "text": cleaned, "bbox": {}, "confidence": 0.64})
+        return output
+
     def _domain_merchant_candidates(self, lines: list[dict[str, Any]], parser_json: dict[str, Any]) -> list[tuple[str, str, int | None]]:
         found: list[tuple[str, str, int | None]] = []
         sources = [(line["text"], line["index"]) for line in lines[:40]]
@@ -571,6 +619,112 @@ class ReceiptAgentOrchestrator:
                 if merchant:
                     found.append((f"{match.group(1)}.{match.group(2)}", merchant, line_index))
         return found
+
+    def _return_policy_merchant_candidates(self, lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        output: list[dict[str, Any]] = []
+        if not lines:
+            return output
+        text_values = [str(line.get("text") or "") for line in lines[:140]]
+        combined = "\n".join(text_values)
+        combined_upper = combined.upper()
+        has_policy_context = bool(re.search(r"\b(?:RETURN|REFUND|EXCHANGE|RETURNS?)\b", combined_upper)) and bool(re.search(r"\bPOLIC", combined_upper))
+        pharmacy_context = bool(re.search(r"\bPHAR[HMN]?ACY\b|\bPRESCRIPTION\b|\bRX\b", combined_upper))
+
+        if has_policy_context and pharmacy_context:
+            for index, text in enumerate(text_values):
+                window = " ".join(text_values[max(0, index - 2): index + 3])
+                if not re.search(r"\b(?:RETURN|REFUND|EXCHANGE|RETURNS?|POLIC)", window, flags=re.IGNORECASE):
+                    continue
+                if self._window_contains_cvs_policy_clue(window):
+                    output.append({
+                        "merchant": "CVS",
+                        "confidence": 0.97,
+                        "source": "return_policy_merchant_clue",
+                        "reasons": ["return_policy_text", "pharmacy_context", "ocr_acronym_recovery"],
+                        "lineIndex": lines[index].get("index"),
+                        "evidence": window[:180],
+                    })
+                    break
+
+        for index, text in enumerate(text_values):
+            window = " ".join(text_values[max(0, index - 1): index + 2])
+            for raw_merchant in self._extract_policy_merchants_from_text(window):
+                merchant = self._normalize_policy_merchant(raw_merchant)
+                if not merchant:
+                    continue
+                output.append({
+                    "merchant": merchant,
+                    "confidence": 0.93,
+                    "source": "return_policy_merchant_clue",
+                    "reasons": ["merchant_named_in_return_policy"],
+                    "lineIndex": lines[index].get("index"),
+                    "evidence": window[:180],
+                })
+        return output
+
+    def _window_contains_cvs_policy_clue(self, text: str) -> bool:
+        for token in re.findall(r"\b[A-Za-z0-9]{2,5}\b", str(text or "")):
+            normalized = token.upper().replace("5", "S").replace("0", "O").replace("1", "I").replace("U", "V")
+            if normalized == "CVS":
+                return True
+        compact = re.sub(r"[^A-Z0-9]+", "", str(text or "").upper())
+        return "CVSRETURN" in compact or "CVSPOLIC" in compact
+
+    def _extract_policy_merchants_from_text(self, text: str) -> list[str]:
+        normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+        patterns = [
+            r"\b(?P<merchant>[A-Za-z0-9&'./# -]{2,70}?)\s+(?:RETURN|RETURNS|REFUND|EXCHANGE)\s+POLIC\w*",
+            r"\b(?:RETURN|RETURNS|REFUND|EXCHANGE)\s+POLIC\w*(?:\s+(?:AT|FOR|FROM))\s+(?P<merchant>[A-Za-z0-9&'./# -]{2,70})",
+        ]
+        found: list[str] = []
+        for pattern in patterns:
+            for match in re.finditer(pattern, normalized, flags=re.IGNORECASE):
+                found.append(match.group("merchant"))
+        return found
+
+    def _normalize_policy_merchant(self, value: str) -> str:
+        cleaned = re.sub(r"[^A-Za-z0-9&'./# -]+", " ", str(value or ""))
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" -_:;,.")
+        if not cleaned:
+            return ""
+        cleaned = re.sub(
+            r"^(?:VISIT|SEE|VIEW|READ|OUR|THE|A|AN|YOUR|THIS|STORE|PLEASE|SUBJECT|WITH|RECEIPT|CUSTOMER|RETURNS?|ACCEPTED|UNDER)\s+",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip(" -_:;,.")
+        cleaned = re.sub(r"^(?:ACCEPTED|UNDER)\s+", "", cleaned, flags=re.IGNORECASE).strip(" -_:;,.")
+        cleaned = re.sub(
+            r"\s+(?:VISIT|SEE|VIEW|READ|OUR|THE|A|AN|YOUR|THIS|STORE|PLEASE|SUBJECT|WITH|RECEIPT|CUSTOMER)$",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip(" -_:;,.")
+        tokens = re.findall(r"[A-Za-z0-9&'./#-]+", cleaned)
+        if not tokens:
+            return ""
+        if len(tokens) > 4:
+            tokens = tokens[-4:]
+        upper_tokens = [token.upper().replace("5", "S").replace("0", "O").replace("1", "I").replace("U", "V") for token in tokens]
+        if "CVS" in upper_tokens:
+            return "CVS"
+        generic = {
+            "RETURN", "RETURNS", "REFUND", "EXCHANGE", "POLICY", "POLICU", "POLICIES",
+            "SUBJECT", "RECEIPT", "WITH", "THRU", "THROUGH", "DATE", "ITEM", "ITEMS",
+            "ACCEPTED", "UNDER",
+        }
+        tokens = [token for token in tokens if token.upper() not in generic]
+        if not tokens:
+            return ""
+        alpha_count = sum(1 for token in tokens if re.search(r"[A-Za-z]", token))
+        if alpha_count == 0:
+            return ""
+        candidate = " ".join(tokens)
+        if len(re.sub(r"[^A-Za-z]", "", candidate)) < 3:
+            return ""
+        if re.fullmatch(r"(?:STORE|STR|PHARMACY|ROAD|NORTH|SOUTH|EAST|WEST)(?:\s+#?\d+)?", candidate, flags=re.IGNORECASE):
+            return ""
+        return self._title_merchant(candidate)
 
     def _merchant_from_domain_label(self, label: str) -> str:
         cleaned = re.sub(r"(?:FEEDBACK|SURVEY|REWARDS|REWARD|RECEIPTS?)$", "", str(label or ""), flags=re.IGNORECASE)
@@ -633,8 +787,11 @@ class ReceiptAgentOrchestrator:
                 score = min(score, 0.89)
             confidence = max(0.0, min(0.96, score))
             if confidence >= 0.62:
+                merchant = self._title_merchant(text)
+                if not re.search(r"[A-Za-z]{3,}", merchant):
+                    continue
                 output.append({
-                    "merchant": self._title_merchant(text),
+                    "merchant": merchant,
                     "confidence": round(confidence, 3),
                     "source": "visual_hierarchy_centered_header",
                     "reasons": reasons,
@@ -660,6 +817,10 @@ class ReceiptAgentOrchestrator:
 
     def _looks_like_merchant_header_text(self, text: str) -> bool:
         upper = str(text or "").upper()
+        letters = re.sub(r"[^A-Z]", "", upper)
+        digits = re.sub(r"\D", "", upper)
+        if re.search(r"\b(?:STORE|STR|PHARMACY|TEL|PHONE)\b", upper) and len(digits) > max(3, len(letters)):
+            return False
         return (
             bool(re.search(r"[A-Z]{3,}", upper))
             and not re.search(r"\d{1,7}(?:[.,]\d{2})", upper)

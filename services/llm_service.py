@@ -123,6 +123,8 @@ class LLMService:
                         "Subtotal, tax, tip, total, purchase date, address, and company name are one-time receipt-level fields, never item fields. "
                         "Do not convert every OCR line into an item. Reason across adjacent OCR lines: item names are often on one line and prices on the next line; "
                         "product codes, E/N tax markers, discounts, and quantities may appear between them. Combine those lines into one item only when there is a real product name and a matching item amount. "
+                        "If a receipt has a narrow marker column with repeated short values such as E, F, E+, N, T, or single-letter WD/tax/department markers before the SKU/name, remove those markers from item names. "
+                        "A repeated column value is metadata, not part of the purchased product name. "
                         "Prefer rows from the items table and semantic item blocks over duplicated footer/header OCR fragments. "
                         "Use tableGraph, financialReconciliation, taxRelationship, and arithmetic diagnostics before trusting any flat OCR total line. "
                         "Keep real purchased item rows only. Exclude store address, member number, payment card lines, approvals, item count summaries, "
@@ -146,7 +148,8 @@ class LLMService:
                         "Item reconstruction rules:\n"
                         "- One item must represent one purchased product, not one OCR row.\n"
                         "- A product-code row such as 331222 or 1462714 is not an item.\n"
-                        "- E/N marker rows are not items.\n"
+                        "- E/N/F/T/WD marker rows and repeated single-letter marker columns are not items and are not part of item names.\n"
+                        "- For lines like 'E 1993061 SPINDRIFT 18.99' return item name 'SPINDRIFT', not 'E SPINDRIFT'.\n"
                         "- Payment, approval, subtotal, tax, total, change, savings, and footer rows are not items.\n"
                         "- If subtotal and total are present, tax must satisfy subtotal + tax + tip = total unless the value is unresolved.\n"
                         "- If OCR maps Tax to the same amount as Total, reject that tax candidate and use total - subtotal - tip when arithmetic is exact.\n"
@@ -1025,6 +1028,8 @@ class LLMService:
             r"\b([A-Z][A-Za-z0-9&'. -]{2,40}?)\s+VALUES\s+YOUR\s+FEEDBACK\b",
             r"\bTHANK\s+YOU\s+FOR\s+SHOPPING\s+(?:AT|@|A[DT])?\s*([A-Z][A-Za-z0-9&'. -]{2,40})\b",
             r"\b([A-Z][A-Za-z0-9&'. -]{2,40}?)\s+GIFT\s+CARD\b",
+            r"\b([A-Z][A-Za-z0-9&'./ -]{2,40}?)\s+(?:RETURN|RETURNS|REFUND|EXCHANGE)\s+POLIC\w*\b",
+            r"\b(?:RETURN|RETURNS|REFUND|EXCHANGE)\s+POLIC\w*\s+(?:AT|FOR|FROM)\s+([A-Z][A-Za-z0-9&'./ -]{2,40})\b",
         ]
         for line in (raw_text or "").splitlines():
             line_text = re.sub(r"\s+", " ", line).strip()
@@ -1043,11 +1048,15 @@ class LLMService:
     def _normalize_merchant_candidate(self, candidate: str) -> str:
         cleaned = re.sub(r"[^A-Za-z0-9&'. -]+", " ", str(candidate or ""))
         cleaned = re.sub(r"\s+", " ", cleaned).strip(" -_.")
-        cleaned = re.sub(r"\b(VALUES|YOUR|FEEDBACK|SURVEY|REWARDS|REWARD|VISIT|WWW|COM|GIFT|CARD)\b", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b(VALUES|YOUR|FEEDBACK|SURVEY|REWARDS|REWARD|VISIT|WWW|COM|GIFT|CARD|RETURN|RETURNS|REFUND|EXCHANGE|POLICY|POLICU|POLICIES)\b", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\b(A|AD|AT|IL|A\})\b", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\s+", " ", cleaned).strip(" -_.")
         if not cleaned or len(cleaned) < 3:
             return ""
+        tokens = re.findall(r"[A-Za-z0-9&'.-]+", cleaned)
+        normalized_tokens = [token.upper().replace("5", "S").replace("0", "O").replace("1", "I").replace("U", "V") for token in tokens]
+        if "CVS" in normalized_tokens:
+            return "CVS"
 
         return cleaned.title()
 

@@ -1,5 +1,3 @@
-import os
-
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from models.schemas import (
@@ -35,68 +33,6 @@ receipt_agent_orchestrator = ReceiptAgentOrchestrator(
     receipt_ocr_service=receipt_ocr_service,
     llm_service=llm_service,
 )
-
-
-def _needs_ocr_fallback(donut_json: dict, raw_text: str = "", lines: list | None = None, ocr_blocks: list | None = None) -> bool:
-    if str(raw_text or "").strip() or any(str(line).strip() for line in (lines or [])) or ocr_blocks:
-        return False
-    if not donut_json.get("available"):
-        return True
-    if str(donut_json.get("rawText") or "").strip():
-        return False
-    if donut_json.get("items"):
-        return False
-    return True
-
-
-def _merge_ocr_fallback(raw_text: str, lines: list, ocr_blocks: list, ocr_result: dict) -> tuple[str, list, list]:
-    next_raw_text = raw_text or str(ocr_result.get("rawText") or "")
-    next_lines = lines or ocr_result.get("rawLines") or []
-    next_blocks = ocr_blocks or ocr_result.get("ocrBlocks") or []
-    return next_raw_text, next_lines, next_blocks
-
-
-def _public_image_url(value: str) -> str:
-    raw = str(value or "").strip()
-    if not raw:
-        return ""
-    if raw.lower().startswith(("http://", "https://")):
-        return raw
-    base_url = os.getenv("OPENGRIT_PUBLIC_IMAGE_BASE_URL", "https://opengrit.com/images").rstrip("/")
-    return f"{base_url}/{raw.lstrip('/')}"
-
-
-def _flatten_receipt_response(receipt: dict, *, source: str = "ai-backend") -> dict:
-    data = receipt.get("llama") or receipt.get("semantic") or receipt
-    semantic = receipt.get("semantic") if isinstance(receipt.get("semantic"), dict) else {}
-    donut = receipt.get("donut") if isinstance(receipt.get("donut"), dict) else {}
-    items = data.get("items") or semantic.get("items") or donut.get("items") or []
-    raw_text = data.get("rawText") or semantic.get("rawText") or donut.get("rawText") or ""
-    raw_lines = data.get("rawLines") or semantic.get("rawLines") or raw_text.splitlines()
-    return {
-        "company": data.get("company") or data.get("storeName") or semantic.get("company") or donut.get("merchant") or "",
-        "storeName": data.get("storeName") or data.get("company") or semantic.get("storeName") or donut.get("merchant") or "",
-        "storeAddress": data.get("storeAddress") or semantic.get("storeAddress") or donut.get("address") or "",
-        "date": data.get("purchaseDate") or data.get("date") or semantic.get("purchaseDate") or semantic.get("date") or donut.get("purchaseDate") or donut.get("date") or "",
-        "purchaseDate": data.get("purchaseDate") or data.get("date") or semantic.get("purchaseDate") or semantic.get("date") or donut.get("purchaseDate") or donut.get("date") or "",
-        "subTotal": data.get("subTotal") or data.get("subtotal") or semantic.get("subTotal") or semantic.get("subtotal") or "",
-        "subtotal": data.get("subtotal") or data.get("subTotal") or semantic.get("subtotal") or semantic.get("subTotal") or "",
-        "tax": data.get("tax") or semantic.get("tax") or donut.get("tax") or "",
-        "tip": data.get("tip") or semantic.get("tip") or donut.get("tip") or "",
-        "total": data.get("total") or semantic.get("total") or donut.get("total") or "",
-        "cardUsed": data.get("cardUsed") or data.get("cardBrand") or semantic.get("cardUsed") or "",
-        "lastFour": data.get("lastFour") or data.get("cardLastFour") or semantic.get("lastFour") or "",
-        "items": items,
-        "rawText": raw_text,
-        "rawLines": raw_lines,
-        "ocrVariants": data.get("ocrVariants") or semantic.get("ocrVariants") or [],
-        "documentUnderstanding": donut or data.get("documentUnderstanding") or {},
-        "meta": {
-            "ocrEngine": data.get("ocrEngine") or semantic.get("ocrEngine") or source,
-            "source": source,
-            "legacyCompatibility": True,
-        },
-    }
 
 
 @router.post("/index")
@@ -252,7 +188,7 @@ async def receipt_document_understanding(payload: ReceiptDocumentUnderstandingRe
             lines=payload.lines,
             ocr_blocks=payload.ocr_blocks,
             parser_json=payload.parser_json,
-            ocr_engine=payload.ocr_engine or "donut+ocr-agent",
+            ocr_engine=payload.ocr_engine or "receipt-agent",
             ocr_variants=payload.ocr_variants,
             run_llama=payload.run_llama,
         )
@@ -282,7 +218,7 @@ async def receipt_document_understanding_upload(request: Request):
             lines=lines,
             ocr_blocks=ocr_blocks,
             parser_json={},
-            ocr_engine="donut-upload-agent",
+            ocr_engine="receipt-upload-agent",
             run_llama=False,
         )
     except DonutUnavailableError as exc:
@@ -317,52 +253,3 @@ async def isolate_receipt_image(request: Request):
             "X-Receipt-Background-Removed": str(result.diagnostics.get("backgroundRemoved", False)).lower(),
         },
     )
-
-
-@router.post("/imageTranslation/")
-async def legacy_image_translation(payload: dict):
-    """Compatibility endpoint for the removed Django OCR service.
-
-    Shellspy still posts to `/imageTranslation/` through its configured
-    receipt URL. Keep that contract while routing the work through the
-    FastAPI receipt intelligence engine.
-    """
-    raw_text = str(payload.get("rawText") or payload.get("raw_text") or "")
-    lines = payload.get("lines") or payload.get("rawLines") or []
-    if not isinstance(lines, list):
-        lines = [str(lines)]
-    ocr_blocks = payload.get("ocr_blocks") or payload.get("ocrBlocks") or []
-    if not isinstance(ocr_blocks, list):
-        ocr_blocks = []
-    parser_json = payload.get("parser_json") or payload.get("parserJson") or {}
-    if not isinstance(parser_json, dict):
-        parser_json = {}
-
-    has_structured_text = raw_text.strip() or any(str(line).strip() for line in lines) or ocr_blocks
-    if has_structured_text:
-        semantic = llm_service.receipt_intelligence.to_structured_json(
-            raw_text=raw_text,
-            lines=lines,
-            parser_json=parser_json,
-            ocr_blocks=ocr_blocks,
-            ocr_engine=str(payload.get("ocrEngine") or payload.get("ocr_engine") or "legacy-imageTranslation"),
-        )
-        return _flatten_receipt_response(semantic, source="ai-backend-semantic")
-
-    image_url = _public_image_url(str(payload.get("image_url") or payload.get("imageUrl") or payload.get("url") or ""))
-    if not image_url:
-        raise HTTPException(status_code=400, detail="url, image_url, rawText, lines, or ocr_blocks is required.")
-    result = await receipt_document_understanding(
-        ReceiptDocumentUnderstandingRequest(
-            image_url=image_url,
-            parser_json=parser_json,
-            ocr_engine=str(payload.get("ocrEngine") or payload.get("ocr_engine") or "legacy-imageTranslation"),
-            run_llama=True,
-        )
-    )
-    return _flatten_receipt_response(result, source="ai-backend-document-understanding")
-
-
-@router.post("/pdf/")
-async def legacy_pdf_translation(payload: dict):
-    return await legacy_image_translation(payload)
