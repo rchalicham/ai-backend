@@ -1209,3 +1209,611 @@ The platform's constitutional boundary is simple:
 
 That separation is the foundation for a platform that can improve continuously
 without sacrificing compatibility, explainability, or architectural integrity.
+
+---
+
+## 20. Business capability model
+
+The Business Capability Model describes what the enterprise must be able to do.
+It is independent of organizational structure, implementation technology, and
+deployment topology. Capabilities remain stable even as the components that
+realize them evolve.
+
+### 20.1 Capability map
+
+```mermaid
+flowchart TD
+    capture[Capture Evidence]
+    normalize[Normalize Evidence]
+    layout[Understand Physical Layout]
+    classify[Classify Receipt Family]
+    semantics[Understand Document Semantics]
+    validate[Validate Business Facts]
+    learn[Learn From Corrections]
+    explain[Explain Decisions]
+    integrate[Integrate With Enterprise Systems]
+
+    capture --> normalize
+    normalize --> layout
+    layout --> classify
+    classify --> semantics
+    semantics --> validate
+    validate --> integrate
+    capture --> explain
+    normalize --> explain
+    layout --> explain
+    classify --> explain
+    semantics --> explain
+    validate --> explain
+    integrate -. outcomes .-> learn
+    learn -. approved knowledge .-> classify
+    learn -. approved knowledge .-> semantics
+```
+
+### 20.2 Capability definitions
+
+| Capability | Purpose | Accountable owner | Inputs | Outputs | Supporting architecture layers |
+|---|---|---|---|---|---|
+| Capture Evidence | Accept receipt evidence from interactive, system, and batch channels while preserving source provenance. | Receipt Platform Product Owner | Images, files, source identifiers, capture context | Identified source evidence | Receipt image boundary, Receipt API |
+| Normalize Evidence | Establish a consistent, quality-controlled physical frame and provenance-preserving OCR observations. | Document Evidence Architecture | Source evidence, capture metadata | Geometry, coordinate truth, OCR observations | Geometry Engine, future OCR Consensus |
+| Understand Physical Layout | Represent physical content and determine how it is spatially organized. | Physical Document Architecture | Geometry and OCR observations | Physical AST, structure annotations, reading order | Receipt DOM, Physical Structure Engine |
+| Classify Receipt Family | Rank learned receipt families using physical evidence without asserting merchant identity. | Classification and Decision Intelligence | Physical document, structure, approved family profiles | Ranked family hypotheses, confidence, explanations | Merchant Intelligence, Receipt Classification |
+| Understand Document Semantics | Assign candidate semantic roles through declarative expectations and evidence. | Semantic Intelligence Architecture | Physical evidence, family hypotheses, grammar knowledge | Semantic annotations and alternatives | Future Merchant Detection, Receipt Grammar |
+| Validate Business Facts | Reconcile candidates and test business facts for arithmetic, temporal, spatial, and logical consistency. | Business Reasoning Architecture | Semantic candidates, constraints, provenance | Validated or rejected business-fact candidates | Future Constraint Solver, Product Intelligence |
+| Learn From Corrections | Turn approved outcomes and corrections into governed, versioned knowledge improvements. | Knowledge Governance | Corrections, observations, review decisions | Learning events, approved knowledge versions | Merchant Intelligence, future Learning Engine |
+| Explain Decisions | Make every material hypothesis and conclusion traceable to evidence, rules, knowledge versions, and confidence. | AI Governance and Assurance | Evidence lineage, candidates, scores, constraints, model versions | Human-readable and machine-readable explanations | All layers, diagnostics, future LLM Refinement |
+| Integrate With Enterprise Systems | Exchange receipt evidence and governed business facts with enterprise consumers. | Enterprise Integration Architecture | Requests, validated facts, provenance, policy context | Versioned API responses, events, enterprise records | Receipt API, Enterprise APIs, downstream adapters |
+
+### 20.3 Capability governance
+
+- A capability owner is accountable for the capability contract and quality
+  outcomes, not necessarily for every supporting component.
+- A supporting layer MAY realize multiple capabilities, but its architectural
+  knowledge boundary remains unchanged.
+- Capability maturity SHALL be assessed independently from feature count.
+- New components SHALL identify the capability they advance and the contract
+  through which they participate.
+
+---
+
+## 21. Enterprise context view — C4 Level 1
+
+The Receipt Intelligence Platform is a bounded enterprise system that receives
+receipt evidence from people and systems, uses approved document and AI services,
+and publishes governed results to enterprise consumers. External systems do not
+receive direct access to internal physical models or knowledge stores; enterprise
+contracts mediate those exchanges.
+
+```mermaid
+flowchart LR
+    endUsers[End Users]
+    mobileApps[Mobile Apps]
+    webApps[Web Applications]
+    posSystems[POS Systems]
+    batchProcessing[Batch Processing]
+    platform[Receipt Intelligence Platform]
+    ocrServices[OCR Services]
+    knowledgeRepository[(Knowledge Repository)]
+    aiServices[AI Services]
+    enterpriseApis[Enterprise APIs]
+    accountingSystems[Accounting Systems]
+    erpSystems[ERP]
+    analyticsSystems[Analytics]
+
+    endUsers --> mobileApps
+    endUsers --> webApps
+    mobileApps -->|"Submit evidence"| platform
+    webApps -->|"Submit and review"| platform
+    posSystems -->|"Provide receipts"| platform
+    batchProcessing -->|"Submit batches"| platform
+    platform -->|"Request observations"| ocrServices
+    platform -->|"Read approved knowledge"| knowledgeRepository
+    platform -->|"Bounded refinement"| aiServices
+    platform -->|"Publish governed results"| enterpriseApis
+    enterpriseApis --> accountingSystems
+    enterpriseApis --> erpSystems
+    enterpriseApis --> analyticsSystems
+```
+
+### 21.1 Actors and neighboring systems
+
+| Actor or system | Relationship to the platform |
+|---|---|
+| End Users | Capture, submit, review, and correct receipt evidence through authorized applications. |
+| Mobile Apps | Interactive capture channel; submits evidence and presents status or review outcomes. |
+| Web Applications | Submission, developer diagnostics, operations, and governed human review channel. |
+| POS Systems | System-originated source of receipt evidence and transaction context where authorized. |
+| Batch Processing | High-volume, asynchronous submission and result-retrieval channel. |
+| OCR Services | Replaceable evidence providers; return observations with engine provenance. |
+| Knowledge Repository | Authoritative source of approved, versioned merchant and family knowledge. |
+| AI Services | Optional bounded refinement providers, including approved local or remote models. |
+| Enterprise APIs | Governed integration boundary for results, status, provenance, and corrections. |
+| Accounting Systems | Consumer of validated, policy-approved receipt business facts. |
+| ERP | Consumer or reconciler of enterprise transaction records and related master data. |
+| Analytics | Consumer of permitted aggregate facts, operational quality, and explainability measures. |
+
+### 21.2 Context boundary rules
+
+- Source channels SHALL authenticate and SHALL provide source identifiers where
+  available.
+- External OCR and AI services SHALL be governed by privacy, data residency, and
+  model-usage policy.
+- Enterprise consumers SHALL receive contract-approved records, not mutable
+  internal objects.
+- The Knowledge Repository SHALL be accessed through governed repository
+  contracts, never exposed directly to user channels.
+
+---
+
+## 22. Container architecture — C4 Level 2
+
+This view distinguishes deployable containers from capabilities hosted inside a
+container. Geometry, the Receipt DOM, Physical Structure, Classification, the
+current parser, and future reasoning engines are architectural components hosted
+by the Receipt Intelligence Pipeline; they are not asserted to be independently
+deployed. They MAY become separate deployable containers later without changing
+their layer contracts.
+
+```mermaid
+flowchart LR
+    subgraph channels ["Enterprise Channels"]
+        channelApps[Mobile and Web Apps]
+        channelSystems[POS and Batch Clients]
+    end
+
+    subgraph apiContainer ["Receipt API Container"]
+        receiptApi[Receipt API]
+    end
+
+    subgraph pipelineContainer ["Receipt Intelligence Pipeline Container"]
+        pipeline[Receipt Intelligence Pipeline]
+        geometryEngine[Geometry Engine]
+        receiptDom[Receipt DOM]
+        structureEngine[Physical Structure Engine]
+        classificationEngine[Receipt Classification Engine]
+        currentParser[Current Parser]
+        grammarEngine[Future Grammar Engine]
+        constraintSolver[Future Constraint Solver]
+    end
+
+    subgraph uiContainer ["Developer Experience Container"]
+        debugUi[Debug UI]
+    end
+
+    subgraph knowledgeContainer ["Knowledge Access Container"]
+        knowledgeRepository[Merchant Knowledge Repository]
+    end
+
+    subgraph dataStores ["Enterprise Data Stores"]
+        mongoDb[(MongoDB)]
+    end
+
+    subgraph providers ["Approved Providers"]
+        ocrProviders[OCR Providers]
+        localLlm[Local LLM]
+    end
+
+    channelApps -->|"HTTPS"| receiptApi
+    channelSystems -->|"API or batch"| receiptApi
+    receiptApi -->|"Request context"| pipeline
+    pipeline --> geometryEngine
+    geometryEngine --> receiptDom
+    receiptDom --> structureEngine
+    structureEngine --> classificationEngine
+    knowledgeRepository -->|"Approved profiles"| classificationEngine
+    classificationEngine --> currentParser
+    classificationEngine -. future .-> grammarEngine
+    grammarEngine -. future .-> constraintSolver
+    pipeline -->|"Knowledge access"| knowledgeRepository
+    knowledgeRepository -->|"Versioned records"| mongoDb
+    pipeline -->|"Observation request"| ocrProviders
+    pipeline -->|"Bounded refinement"| localLlm
+    debugUi -->|"Read developer diagnostics"| receiptApi
+```
+
+### 22.1 Container responsibilities
+
+| Container | Architectural responsibility |
+|---|---|
+| Receipt API | Enterprise ingress, request validation, authentication boundary, contract negotiation, and response delivery. |
+| Receipt Intelligence Pipeline | Request-scoped orchestration of evidence and reasoning stages while enforcing compatibility and fail-open boundaries. |
+| Developer Experience | Authorized visualization of evidence, annotations, confidence, comparisons, and diagnostics; never a production decision source. |
+| Knowledge Access | Governed access to approved blueprints, families, profiles, statistics, vocabulary, and learning history. |
+| MongoDB | Durable persistence for versioned knowledge and future persistence contracts; not a domain boundary by itself. |
+| OCR Providers | Replaceable providers of provenance-bearing observations. |
+| Local LLM | Optional private refinement provider operating within bounded evidence and policy contracts. |
+
+### 22.2 Container evolution rules
+
+- Component extraction into a separate service SHALL preserve the existing layer
+  contract, versioning, diagnostics, and immutability.
+- Network distribution SHALL not turn internal object identity into an unstable
+  transport concern; identifiers and provenance remain durable.
+- The Debug UI SHALL remain read-only with respect to runtime evidence.
+- Future Grammar and Constraint containers SHALL enter in shadow mode before
+  receiving extraction authority.
+
+---
+
+## 23. Information architecture
+
+The platform manages an information continuum from raw evidence to governed
+enterprise records. Each stage has a distinct owner, mutability policy, retention
+profile, and fitness-for-use standard.
+
+### 23.1 Information lifecycle
+
+```mermaid
+flowchart LR
+    image[Receipt Image] --> geometry[Geometry]
+    geometry --> physical[Physical Evidence]
+    physical --> observations[Observations]
+    observations --> hypotheses[Hypotheses]
+    approvedKnowledge[(Approved Knowledge)] --> hypotheses
+    hypotheses --> businessFacts[Business Facts]
+    businessFacts --> enterpriseRecords[Enterprise Records]
+    observations -. governed learning .-> proposals[Knowledge Proposals]
+    proposals --> approval{Approval}
+    approval -->|Approved| approvedKnowledge
+    approval -->|Rejected| audit[Decision Audit]
+```
+
+The example sequence “Physical Evidence → Observations → Knowledge →
+Hypotheses” is not a destructive transformation. Approved Knowledge is a
+separately governed information domain that informs hypotheses. Runtime
+observations may create knowledge proposals, but only approval promotes them to
+knowledge.
+
+### 23.2 Information domains
+
+| Information domain | Owner | Creation point | Mutability and lifecycle | Principal consumers |
+|---|---|---|---|---|
+| Receipt Image | Evidence Custodian | Capture boundary | Immutable source; retained or deleted by privacy policy | Geometry, OCR, audit |
+| Receipt Geometry | Geometry layer | Geometry analysis | Immutable versioned derivation; replayable from source and engine version | DOM, diagnostics |
+| Physical Evidence | Receipt DOM | DOM construction | Immutable AST with stable identity for the request or persisted document lifecycle | Structure, classification, future semantic engines |
+| Observation | Observation-producing engine | OCR, structure, classifier, or future engine | Append-only or superseding annotation; never silently overwrites source evidence | Reasoning, diagnostics, learning |
+| Approved Knowledge | Knowledge Governance | Approved repository change | Versioned and reversible; active versions are immutable | Classification, grammar, constraints, product intelligence |
+| Hypothesis | Reasoning layer | Classification, grammar, or refinement | Immutable candidate with confidence and provenance; may be accepted, rejected, or superseded | Constraint Solver, human review |
+| Business Fact | Business Reasoning | Constraint-validated decision boundary | Versioned conclusion linked to supporting and conflicting evidence | Enterprise APIs, review, audit |
+| Enterprise Record | System of Record owner | Downstream acceptance | Governed by downstream record policy and reconciliation lifecycle | Accounting, ERP, analytics |
+| Learning Event | Learning Governance | Correction or approved observation | Append-oriented audit event; proposal and approval state are retained | Knowledge Governance, quality analytics |
+
+### 23.3 Information ownership
+
+- Ownership means authority to define meaning, quality rules, lifecycle, and
+  access—not exclusive physical storage.
+- The layer that creates an information type owns its contract.
+- Storage technology SHALL NOT become the owner of domain meaning.
+- Enterprise consumers own the records they accept; the platform retains
+  provenance linking those records to receipt conclusions.
+
+### 23.4 Information immutability
+
+- Source evidence and material derivations SHALL be content-addressable or
+  otherwise uniquely identifiable where persistence requires replay.
+- Corrections SHALL create new annotations, conclusions, or knowledge versions.
+- A superseding artifact SHALL reference the artifact it supersedes.
+- Deletion required by privacy policy MAY remove data, but SHALL leave the
+  minimum lawful audit marker needed to explain that a governed deletion
+  occurred.
+
+### 23.5 Information provenance
+
+Every material derived artifact SHOULD identify:
+
+- source receipt and source page;
+- upstream node or artifact identifiers;
+- coordinate system where applicable;
+- producer and producer version;
+- contract version;
+- knowledge profile versions used;
+- creation time;
+- confidence and evidence coverage;
+- review, approval, or supersession references where applicable.
+
+Provenance SHALL be sufficient to reproduce a deterministic decision or to state
+why exact reproduction is not possible.
+
+---
+
+## 24. Enterprise domain model
+
+The Enterprise Domain Model defines canonical concepts and relationships. It is
+conceptual, not a persistence schema. Cardinalities communicate domain meaning
+and do not prescribe collection design.
+
+```mermaid
+erDiagram
+    MERCHANT ||--o{ RECEIPT_FAMILY : defines
+    RECEIPT_FAMILY ||--o{ RECEIPT : characterizes
+    RECEIPT ||--|| RECEIPT_GEOMETRY : has
+    RECEIPT ||--|| RECEIPT_DOCUMENT : represented_by
+    RECEIPT_DOCUMENT ||--|| PHYSICAL_STRUCTURE : organized_by
+    RECEIPT_DOCUMENT ||--o{ ANNOTATION : referenced_by
+    RECEIPT_FAMILY ||--o{ GRAMMAR : described_by
+    GRAMMAR ||--o{ CONSTRAINT : governed_by
+    KNOWLEDGE ||--o{ RECEIPT_FAMILY : informs
+    KNOWLEDGE ||--o{ PRODUCT : describes
+    LEARNING_EVENT }o--|| KNOWLEDGE : proposes_change_to
+    ANNOTATION }o--o{ BUSINESS_FACT : supports
+    CONSTRAINT }o--o{ BUSINESS_FACT : validates
+    PRODUCT ||--o{ BUSINESS_FACT : identifies
+    RECEIPT ||--o{ BUSINESS_FACT : yields
+
+    RECEIPT {
+        string receiptId
+        string sourceReference
+        string lifecycleState
+    }
+    MERCHANT {
+        string merchantId
+        string identityStatus
+        int knowledgeVersion
+    }
+    RECEIPT_FAMILY {
+        string familyId
+        int profileVersion
+        float confidence
+    }
+    RECEIPT_GEOMETRY {
+        string geometryId
+        string coordinateSystem
+        float confidence
+    }
+    RECEIPT_DOCUMENT {
+        string documentId
+        string schemaVersion
+        string physicalIdentity
+    }
+    PHYSICAL_STRUCTURE {
+        string structureId
+        string schemaVersion
+        float confidence
+    }
+    GRAMMAR {
+        string grammarId
+        int version
+        string applicability
+    }
+    CONSTRAINT {
+        string constraintId
+        int version
+        string severity
+    }
+    PRODUCT {
+        string productId
+        string knowledgeScope
+        float confidence
+    }
+    ANNOTATION {
+        string annotationId
+        string annotationType
+        string provenanceReference
+    }
+    KNOWLEDGE {
+        string knowledgeId
+        int version
+        string approvalState
+    }
+    LEARNING_EVENT {
+        string learningEventId
+        string decisionState
+        string provenanceReference
+    }
+    BUSINESS_FACT {
+        string factId
+        string factType
+        float confidence
+    }
+```
+
+### 24.1 Domain definitions
+
+| Entity | Canonical meaning |
+|---|---|
+| Receipt | Aggregate identity for one submitted physical or digital receipt and its lifecycle. |
+| Merchant | Governed identity concept associated with knowledge; never inferred merely from physical family similarity. |
+| Receipt Family | Versioned grouping of receipts sharing learned characteristics; many families may belong to one merchant. |
+| Receipt Geometry | Coordinate truth and physical page envelope derived from source evidence. |
+| Receipt Document | Immutable physical AST representing what exists on the receipt. |
+| Physical Structure | Generic arrangement annotations over Receipt Document identities. |
+| Grammar | Declarative expectations for allowable semantic relationships and document patterns. |
+| Constraint | Versioned rule that evaluates candidate consistency without creating physical evidence. |
+| Product | Governed identity concept supported by vocabulary and other product evidence. |
+| Annotation | Additive assertion, observation, hypothesis, or conclusion referencing immutable evidence. |
+| Knowledge | Approved, versioned information used by generic reasoning engines. |
+| Learning Event | Auditable observation, correction, proposal, or approval that may evolve knowledge. |
+| Business Fact | Validated business conclusion with provenance, confidence, and lifecycle. |
+
+### 24.2 Domain relationship rules
+
+- `ReceiptDocument` represents a Receipt physically; it is not the Receipt's
+  business interpretation.
+- `PhysicalStructure` annotates the Receipt Document without changing it.
+- A `ReceiptFamily` may characterize many receipts, and a receipt may carry
+  multiple ranked family hypotheses before one is accepted.
+- `Grammar`, `Constraint`, and `Knowledge` are versioned enterprise assets, not
+  fields embedded in the physical DOM.
+- `BusinessFact` SHALL retain links to supporting annotations and applicable
+  constraints.
+- A `LearningEvent` MAY propose a knowledge change but SHALL NOT itself become
+  approved knowledge.
+
+---
+
+## 25. Enterprise technology standards
+
+These standards define required qualities and interoperability behavior. They do
+not mandate a specific language, framework, vendor, or deployment product.
+
+### 25.1 Standards catalog
+
+| Standard domain | Mandatory standard |
+|---|---|
+| Versioning | Durable artifacts, APIs, knowledge records, grammars, constraints, and model policies SHALL identify compatible versions. Semantic versioning or an equivalently explicit compatibility scheme SHALL distinguish additive and breaking changes. |
+| Serialization | Cross-boundary representations SHALL use documented, deterministic, language-neutral schemas. Serialized diagnostics SHALL be distinguishable from authoritative business output. |
+| API contracts | Enterprise APIs SHALL be contract-first, authenticated, idempotent where retry is expected, and explicit about errors, confidence, provenance, pagination, and asynchronous status. |
+| Schema evolution | Additive evolution is preferred. Breaking changes require a new major contract, coexistence window, consumer impact assessment, migration, and rollback plan. Unknown additive fields SHOULD be safely ignored. |
+| Logging | Logs SHALL be structured, correlated by request and document identity, severity-classified, and free of unnecessary receipt content or secrets. Logs SHALL distinguish evidence processing from decision outcomes. |
+| Observability | Each authoritative stage SHALL expose latency, availability, error, throughput, confidence-distribution, and quality indicators. Traces SHOULD preserve stage and contract versions. |
+| Security | Least privilege, authenticated service identity, encryption in transit and at rest, secret isolation, dependency governance, and auditable administrative access are mandatory. Trust boundaries SHALL be explicit. |
+| Privacy | Data minimization, purpose limitation, retention, deletion, residency, redaction, and model-provider controls SHALL apply to images, OCR, diagnostics, knowledge, and learning. |
+| Caching | Only artifacts with explicit identity, version, tenant scope, policy scope, and invalidation semantics MAY be cached. Mutable knowledge SHALL be accessed through immutable version references or bounded freshness policy. |
+| Performance | Latency and throughput objectives SHALL be set per channel. Expensive optional stages SHALL support time budgets and degraded operation. Performance optimizations SHALL not bypass provenance or validation. |
+| Testing | Contract, invariant, determinism, calibration, privacy, security, replay, migration, and regression tests SHALL complement unit and integration testing. Representative receipt families SHALL be evaluated without hardcoded family logic. |
+| Backward compatibility | Existing consumers and extraction behavior SHALL remain compatible until a governed migration changes authority. Sidecars SHALL remain additive. Deprecation requires usage evidence, notice, coexistence, and rollback. |
+
+### 25.2 Observability model
+
+Observability SHALL cover four distinct concerns:
+
+1. **Operational health** — availability, saturation, latency, errors, queue age.
+2. **Evidence quality** — image quality, geometry confidence, OCR disagreement,
+   physical coverage.
+3. **Decision quality** — family calibration, constraint outcomes, review rate,
+   false acceptance and rejection.
+4. **Knowledge health** — profile age, sample basis, approval backlog, drift,
+   rollback frequency.
+
+Business-sensitive content SHALL not be included in telemetry merely because it
+is useful for debugging.
+
+### 25.3 Performance and compatibility classifications
+
+- **Interactive path:** prioritizes bounded latency and progressive status.
+- **Batch path:** prioritizes throughput, idempotency, resumability, and
+  deterministic replay.
+- **Learning path:** asynchronous to extraction, approval-aware, and isolated
+  from request latency.
+- **Debug path:** authorized, rate-limited, non-authoritative, and removable
+  without changing extraction.
+
+---
+
+## 26. Architecture repository structure
+
+The architecture repository is the governed collection of architecture assets.
+The physical folder layout MAY evolve, but the artifact categories and their
+authority SHALL remain clear.
+
+```text
+docs/
+└── Enterprise-Architecture/
+    ├── Receipt-Intelligence-Enterprise-Architecture.md
+    ├── decisions/
+    ├── capabilities/
+    ├── reference-architectures/
+    ├── roadmaps/
+    ├── standards/
+    ├── contracts/
+    ├── diagrams/
+    └── governance/
+```
+
+The paths other than the authoritative specification are target repository
+categories. Assets MAY initially remain embedded in this specification and be
+extracted only when their independent lifecycle justifies it.
+
+| Artifact category | Purpose | Authority and lifecycle |
+|---|---|---|
+| Enterprise Architecture Specification | Single constitutional definition of layers, boundaries, rules, current state, and target evolution. | Authoritative; updated every major phase. |
+| Architecture Decision Records | Preserve context, decision, alternatives, consequences, status, and supersession history. | Append-oriented; accepted records are never silently rewritten. |
+| Capability Models | Define stable enterprise abilities, accountable owners, outcomes, and supporting architecture. | Reviewed when strategy or operating model changes. |
+| Reference Architectures | Provide reusable, conformant patterns for OCR, sidecars, learning, integration, security, and deployment. | Versioned guidance; deviations require rationale. |
+| Architecture Roadmaps | Sequence transitions, dependencies, entry criteria, migration gates, and target states. | Time-bound and regularly reviewed. |
+| Standards | Define mandatory interoperability, quality, security, privacy, and lifecycle expectations. | Governed baseline with exception process. |
+| Contracts | Define allowed cross-layer and enterprise information exchange, schemas, compatibility, and ownership. | Versioned; breaking changes require migration. |
+| Diagrams | Provide maintained views for context, containers, information, knowledge, dependencies, and evolution. | Derived from authoritative decisions; stale views SHALL be corrected or retired. |
+| Governance Documents | Define review boards, conformance process, waivers, risks, control evidence, and approval records. | Controlled by architecture and risk governance. |
+
+### 26.1 Repository governance
+
+- Every asset SHALL identify an owner, status, version or effective date, and
+  relationship to the authoritative specification.
+- Duplicate architecture truth SHALL be avoided. Extracted artifacts SHALL link
+  back to the controlling section or ADR.
+- Diagrams are architectural assets, not decoration; a material boundary change
+  requires diagram review.
+- Exceptions SHALL be time-bounded, risk-accepted, and linked to remediation or
+  a superseding ADR.
+
+---
+
+## 27. Architecture traceability matrix
+
+The matrix connects enterprise intent to architectural realization and planned
+evolution. “Future” packages are governed target boundaries, not current
+implementation commitments.
+
+| Business capability | Architecture layer | Implementation package or boundary | Governing ADR | Roadmap phase |
+|---|---|---|---|---|
+| Capture Evidence | Receipt image boundary and enterprise ingress | Receipt API boundary | ADR-002 | Phase 1 foundation; enterprise integration continues |
+| Normalize Evidence | Geometry and future observation consensus | `receipt_geometry`; future `ocr_consensus` | ADR-001, ADR-002 | Phase 1; OCR Consensus in Phase 3 |
+| Understand Physical Layout | Physical DOM and Structure | `receipt_dom`, `receipt_structure` | ADR-001, ADR-002 | Phase 1 |
+| Classify Receipt Family | Knowledge and Classification | `merchant_intelligence`, `receipt_classification` | ADR-003, ADR-004, ADR-005, ADR-007 | Phase 2 |
+| Understand Document Semantics | Future identity and semantic expectations | future `merchant_detection`, future `receipt_grammar` | ADR-003, ADR-005 | Phase 3 |
+| Validate Business Facts | Future deterministic reasoning | future `constraint_solver`, future `product_intelligence` | ADR-006, ADR-008 | Phase 4 |
+| Learn From Corrections | Knowledge governance and future learning | `merchant_intelligence`, future `learning_engine` | ADR-003, ADR-004, ADR-007 | Phase 2 foundation; Phase 5 authority |
+| Explain Decisions | Cross-cutting provenance and bounded refinement | all diagnostic contracts; future `llm_refinement` | ADR-001, ADR-006, ADR-007 | All phases; Phase 5 refinement |
+| Integrate With Enterprise Systems | Enterprise API and compatibility boundary | Receipt API, current parser boundary, future enterprise adapters | ADR-002, ADR-008 | All phases; progressive authority migration |
+
+### 27.1 Traceability use
+
+Architecture reviews SHALL use this matrix to determine:
+
+- whether a proposed component advances a recognized capability;
+- which layer owns the resulting information;
+- which ADRs constrain the design;
+- whether the package dependency direction is conformant;
+- which roadmap entry criteria and migration gates apply.
+
+A new major capability requires a matrix update and, where it changes authority
+or boundaries, a new ADR.
+
+---
+
+## 28. Architecture glossary
+
+| Term | Definition |
+|---|---|
+| Annotation | An additive, versioned assertion that references stable evidence or another governed artifact without mutating it. An annotation may be an observation, hypothesis, semantic role, validation result, or business conclusion. |
+| Approved Knowledge | Knowledge that has passed applicable review or automated governance and is active for runtime use at a declared version. |
+| Blueprint | Versioned aggregate of merchant-associated knowledge, including receipt families, profiles, vocabularies, statistics, and learning metadata. It is not a merchant detection result. |
+| Business Fact | A governed business conclusion supported by evidence and validation, with confidence, provenance, and lifecycle. |
+| Capability | A stable statement of what the enterprise must be able to do, independent of organization and technology. |
+| Confidence | A bounded expression of support for an observation, hypothesis, or conclusion. Platform confidence is decomposable by evidence category, coverage, and processing stage. |
+| Constraint | A versioned rule that evaluates the consistency or acceptability of candidates; it validates but does not create physical evidence. |
+| Coordinate Truth | The authoritative geometric frame and conversion rules established by Receipt Geometry. |
+| Evidence | Information directly captured or deterministically derived with provenance. Evidence is not synonymous with interpretation. |
+| Grammar | Declarative expectations about allowable document roles, sequences, relationships, and structures. Grammar defines expectations; it is not an imperative merchant parser. |
+| Hypothesis | A candidate interpretation that has supporting evidence, confidence, and provenance but has not necessarily been accepted as a business fact. |
+| Immutable | Not changed in place after publication within its lifecycle. Corrections create superseding artifacts or annotations. |
+| Knowledge | Versioned, reusable information approved to inform reasoning across receipts. Knowledge is data, not executable merchant-specific logic. |
+| Learning Event | Auditable observation, correction, proposal, approval, or rejection associated with the evolution of knowledge. |
+| Observation | A provenance-bearing account of what an engine or reviewer perceived. An observation may be uncertain and does not by itself establish business meaning. |
+| Physical Evidence | Geometry, nodes, relationships, and generic layout characteristics representing what physically exists on a receipt. |
+| Provenance | The lineage that identifies source evidence, producing stage and version, knowledge versions, transformations, confidence, and review history. |
+| Receipt | The aggregate identity and lifecycle of one submitted receipt, distinct from any individual representation or interpretation. |
+| Receipt DOM | The canonical immutable physical AST of a receipt, containing identity, hierarchy, geometry, relationships, observed text, confidence, and source references but no business semantics. |
+| Receipt Family | A versioned knowledge concept grouping receipts with shared learned characteristics. Family resemblance is a hypothesis and does not alone establish merchant identity. |
+| Receipt Geometry | The versioned geometric description of a receipt page, including boundary, dimensions, coordinates, rotation, skew, perspective, whitespace, and confidence. |
+| Sidecar | An additive artifact produced alongside existing extraction behavior that is independently observable and non-authoritative until a governed migration grants authority. |
+| Supersession | The governed replacement of an artifact by a new version while retaining the identity and history of what was replaced. |
+
+---
+
+## 29. Enhancement change record
+
+This enhancement adds enterprise capability, context, container, information,
+domain, standards, repository, traceability, and glossary artifacts. It does not
+change any existing principle, layer responsibility, contract, rule, ADR,
+roadmap decision, quality attribute, or governance requirement.
+
+| Field | Value |
+|---|---|
+| Date | 2026-07-27 |
+| Architecture phase | Phases 1–2 baseline and target-state governance |
+| Decision reference | No new architecture decision; artifacts elaborate ADR-001 through ADR-008 |
+| Contract impact | None |
+| Migration impact | None; documentation-only augmentation |
+| Reviewer | Pending Architecture Review Board acknowledgement |
