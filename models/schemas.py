@@ -61,3 +61,4 @@ class ReceiptDocumentUnderstandingRequest(BaseModel):
     ocr_engine: str | None = None
     ocr_variants: list[dict] = Field(default_factory=list)
     run_llama: bool = True
+    merchant_knowledge_key: str = ""

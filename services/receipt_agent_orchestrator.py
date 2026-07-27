@@ -5,6 +5,25 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from services.receipt_geometry import ReceiptGeometryEngine
+from services.receipt_dom import ReceiptDocument, ReceiptDomBuilder, ReceiptDomSerializer
+from services.receipt_structure import (
+    ReceiptPhysicalStructure,
+    ReceiptPhysicalStructureEngine,
+    ReceiptStructureSerializer,
+)
+from services.merchant_intelligence import (
+    MerchantBlueprint,
+    MerchantBlueprintService,
+    MerchantIntelligenceContext,
+    MerchantIntelligenceSerializer,
+)
+from services.receipt_classification import (
+    ReceiptClassification,
+    ReceiptClassificationEngine,
+    ReceiptClassificationSerializer,
+)
+
 
 @dataclass
 class ReceiptAgentAttempt:
@@ -18,6 +37,9 @@ class ReceiptAgentAttempt:
     score: float = 0.0
     retry_plan: list[dict[str, Any]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    receipt_document: ReceiptDocument | None = None
+    receipt_structure: ReceiptPhysicalStructure | None = None
+    receipt_classification: ReceiptClassification | None = None
 
     def summary(self) -> dict[str, Any]:
         validation = self.semantic.get("validation") or {}
@@ -53,11 +75,29 @@ class ReceiptAgentOrchestrator:
         receipt_image_isolation_service: Any,
         receipt_ocr_service: Any,
         llm_service: Any,
+        receipt_geometry_engine: ReceiptGeometryEngine | None = None,
+        receipt_dom_builder: ReceiptDomBuilder | None = None,
+        receipt_dom_serializer: ReceiptDomSerializer | None = None,
+        receipt_structure_engine: ReceiptPhysicalStructureEngine | None = None,
+        receipt_structure_serializer: ReceiptStructureSerializer | None = None,
+        merchant_blueprint_service: MerchantBlueprintService | None = None,
+        merchant_intelligence_serializer: MerchantIntelligenceSerializer | None = None,
+        receipt_classification_engine: ReceiptClassificationEngine | None = None,
+        receipt_classification_serializer: ReceiptClassificationSerializer | None = None,
     ) -> None:
         self.donut_receipt_service = donut_receipt_service
         self.receipt_image_isolation_service = receipt_image_isolation_service
         self.receipt_ocr_service = receipt_ocr_service
         self.llm_service = llm_service
+        self.receipt_geometry_engine = receipt_geometry_engine or ReceiptGeometryEngine()
+        self.receipt_dom_builder = receipt_dom_builder or ReceiptDomBuilder()
+        self.receipt_dom_serializer = receipt_dom_serializer or ReceiptDomSerializer()
+        self.receipt_structure_engine = receipt_structure_engine or ReceiptPhysicalStructureEngine()
+        self.receipt_structure_serializer = receipt_structure_serializer or ReceiptStructureSerializer()
+        self.merchant_blueprint_service = merchant_blueprint_service
+        self.merchant_intelligence_serializer = merchant_intelligence_serializer or MerchantIntelligenceSerializer()
+        self.receipt_classification_engine = receipt_classification_engine or ReceiptClassificationEngine()
+        self.receipt_classification_serializer = receipt_classification_serializer or ReceiptClassificationSerializer()
         self.max_attempts = int(os.getenv("RECEIPT_AGENT_MAX_ATTEMPTS", "3"))
         self.accept_confidence = float(os.getenv("RECEIPT_AGENT_ACCEPT_CONFIDENCE", "0.82"))
         self.review_confidence = float(os.getenv("RECEIPT_AGENT_REVIEW_CONFIDENCE", "0.78"))
@@ -74,11 +114,15 @@ class ReceiptAgentOrchestrator:
         ocr_engine: str | None = None,
         ocr_variants: list[dict[str, Any]] | None = None,
         run_llama: bool = True,
+        source_image_id: str = "",
+        source_filename: str = "",
+        merchant_knowledge_key: str = "",
     ) -> dict[str, Any]:
         parser_json = parser_json or {}
         supplied_lines = lines or []
         supplied_blocks = ocr_blocks or []
         supplied_variants = ocr_variants or []
+        merchant_intelligence = self._load_merchant_intelligence(merchant_knowledge_key)
 
         image_sources = self._image_sources(image_bytes)
         if not image_sources:
@@ -96,6 +140,13 @@ class ReceiptAgentOrchestrator:
                 ocr_engine=ocr_engine,
                 ocr_variants=supplied_variants,
                 run_llama=run_llama,
+                source_image_id=source_image_id,
+                source_filename=source_filename,
+                classification_blueprints=(
+                    (merchant_intelligence.blueprint,)
+                    if merchant_intelligence is not None and merchant_intelligence.blueprint is not None
+                    else ()
+                ),
             )
             attempts.append(attempt)
             if self._attempt_is_good_enough(attempt):
@@ -107,6 +158,16 @@ class ReceiptAgentOrchestrator:
             "semantic": best.semantic,
             "llama": best.llama,
         }
+        if best.receipt_document is not None:
+            response["receiptDocument"] = self.receipt_dom_serializer.to_dict(best.receipt_document, debug=True)
+        if best.receipt_structure is not None:
+            response["receiptStructure"] = self.receipt_structure_serializer.to_dict(best.receipt_structure, debug=True)
+        if best.receipt_classification is not None:
+            response["receiptClassification"] = self.receipt_classification_serializer.to_dict(
+                best.receipt_classification, debug=True,
+            )
+        if merchant_intelligence is not None:
+            response["merchantIntelligence"] = self.merchant_intelligence_serializer.context_to_dict(merchant_intelligence)
         agent = self._build_agent_summary(
             attempts=attempts,
             selected=best,
@@ -116,6 +177,25 @@ class ReceiptAgentOrchestrator:
         response["receiptAgent"] = agent
         self._attach_agent_metadata(response, agent)
         return response
+
+    def _load_merchant_intelligence(self, merchant_knowledge_key: str) -> MerchantIntelligenceContext | None:
+        """Explicit-key knowledge lookup only; never derives or detects merchant identity."""
+        if self.merchant_blueprint_service is None:
+            return None
+        try:
+            return self.merchant_blueprint_service.load_context(merchant_knowledge_key)
+        except Exception as exc:
+            return MerchantIntelligenceContext(
+                merchant_key=merchant_knowledge_key,
+                blueprint=None,
+                loaded=False,
+                diagnostics=(
+                    ("lookupMode", "explicit_key_only"),
+                    ("detectionPerformed", False),
+                    ("affectsExtraction", False),
+                    ("warning", f"knowledge_lookup_failed:{exc.__class__.__name__}"),
+                ),
+            )
 
     async def _run_attempt(
         self,
@@ -129,6 +209,9 @@ class ReceiptAgentOrchestrator:
         ocr_engine: str | None,
         ocr_variants: list[dict[str, Any]],
         run_llama: bool,
+        source_image_id: str,
+        source_filename: str,
+        classification_blueprints: tuple[MerchantBlueprint, ...],
     ) -> ReceiptAgentAttempt:
         image_bytes = source.get("imageBytes") or b""
         use_ocr_first = self._use_ocr_first_attempt(source, run_llama)
@@ -148,6 +231,20 @@ class ReceiptAgentOrchestrator:
             ocr_fallback = self.receipt_ocr_service.extract(image_bytes).to_dict()
             next_raw_text, next_lines, next_blocks = self._merge_ocr_fallback(next_raw_text, next_lines, next_blocks, ocr_fallback)
 
+        receipt_document = self._build_receipt_document(
+            image_bytes=image_bytes,
+            lines=next_lines,
+            ocr_blocks=next_blocks,
+            ocr_engine=ocr_engine or source.get("strategy") or "receipt-agent",
+            source_image_id=source_image_id,
+            source_filename=source_filename,
+        )
+        receipt_structure = self.receipt_structure_engine.safe_analyze(receipt_document)
+        receipt_classification = self.receipt_classification_engine.safe_classify(
+            receipt_document,
+            receipt_structure,
+            classification_blueprints,
+        )
         donut_json = self.donut_receipt_service.consolidate_receipt_rows(
             donut_json,
             raw_text=next_raw_text,
@@ -197,7 +294,37 @@ class ReceiptAgentOrchestrator:
             score=score,
             retry_plan=retry_plan,
             warnings=warnings,
+            receipt_document=receipt_document,
+            receipt_structure=receipt_structure,
+            receipt_classification=receipt_classification,
         )
+
+    def _build_receipt_document(
+        self,
+        *,
+        image_bytes: bytes,
+        lines: list[str],
+        ocr_blocks: list[dict[str, Any]],
+        ocr_engine: str,
+        source_image_id: str,
+        source_filename: str,
+    ) -> ReceiptDocument | None:
+        """Creates request-scoped physical DOM infrastructure without affecting extraction."""
+        geometry = self.receipt_geometry_engine.safe_analyze(image_bytes) if image_bytes else None
+        if geometry is None:
+            return None
+        try:
+            return self.receipt_dom_builder.build(
+                receipt_geometry=geometry,
+                ocr_blocks=ocr_blocks,
+                ocr_lines=lines,
+                source_ocr_engine=ocr_engine,
+                source_image_id=source_image_id,
+                source_filename=source_filename,
+                diagnostics={"sidecar": True, "affectsExtraction": False},
+            )
+        except Exception:
+            return None
 
     def _use_ocr_first_attempt(self, source: dict[str, Any], run_llama: bool) -> bool:
         if not self.ocr_first_reprocess:
@@ -212,12 +339,16 @@ class ReceiptAgentOrchestrator:
         if narrow_crop:
             sources.append(narrow_crop)
         isolation = self.receipt_image_isolation_service.isolate(image_bytes)
+        geometry = self.receipt_geometry_engine.safe_analyze(image_bytes)
+        isolation_diagnostics = dict(isolation.diagnostics)
+        if geometry is not None:
+            isolation_diagnostics["geometry"] = geometry.to_dict()
         if isolation.image_bytes:
             sources.append({
                 "source": "isolated_receipt",
                 "strategy": "isolate_receipt_then_ocr",
                 "imageBytes": isolation.image_bytes,
-                "diagnostics": isolation.diagnostics,
+                "diagnostics": isolation_diagnostics,
             })
         sources.append({"source": "uploaded_image", "strategy": "baseline_document_understanding", "imageBytes": image_bytes, "diagnostics": {}})
         sources.extend(self._opencv_retry_variants(isolation.image_bytes or image_bytes))

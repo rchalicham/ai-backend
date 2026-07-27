@@ -1,3 +1,5 @@
+import os
+
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from models.schemas import (
@@ -16,7 +18,13 @@ from services.llm_service import LLMService
 from services.qdrant_service import QdrantService
 from services.receipt_agent_orchestrator import ReceiptAgentOrchestrator
 from services.receipt_image_isolation import ReceiptImageIsolationService
+from services.receipt_geometry import ReceiptGeometryEngine
 from services.receipt_ocr_service import ReceiptOcrService
+from services.merchant_intelligence import (
+    InMemoryMerchantIntelligenceRepository,
+    MerchantBlueprintService,
+    MongoMerchantIntelligenceRepository,
+)
 
 
 router = APIRouter()
@@ -26,11 +34,24 @@ graph_service = GraphService()
 llm_service = LLMService()
 donut_receipt_service = DonutReceiptService()
 receipt_image_isolation_service = ReceiptImageIsolationService()
+receipt_geometry_engine = ReceiptGeometryEngine()
 receipt_ocr_service = ReceiptOcrService()
+merchant_intelligence_uri = os.getenv("MERCHANT_INTELLIGENCE_MONGO_URI", "").strip()
+merchant_intelligence_repository = (
+    MongoMerchantIntelligenceRepository.from_uri(
+        merchant_intelligence_uri,
+        os.getenv("MERCHANT_INTELLIGENCE_DATABASE", "merchant_intelligence"),
+    )
+    if merchant_intelligence_uri
+    else InMemoryMerchantIntelligenceRepository()
+)
+merchant_blueprint_service = MerchantBlueprintService(merchant_intelligence_repository)
 receipt_agent_orchestrator = ReceiptAgentOrchestrator(
     donut_receipt_service=donut_receipt_service,
     receipt_image_isolation_service=receipt_image_isolation_service,
     receipt_ocr_service=receipt_ocr_service,
+    receipt_geometry_engine=receipt_geometry_engine,
+    merchant_blueprint_service=merchant_blueprint_service,
     llm_service=llm_service,
 )
 
@@ -191,6 +212,7 @@ async def receipt_document_understanding(payload: ReceiptDocumentUnderstandingRe
             ocr_engine=payload.ocr_engine or "receipt-agent",
             ocr_variants=payload.ocr_variants,
             run_llama=payload.run_llama,
+            merchant_knowledge_key=payload.merchant_knowledge_key,
         )
     except DonutUnavailableError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -220,6 +242,8 @@ async def receipt_document_understanding_upload(request: Request):
             parser_json={},
             ocr_engine="receipt-upload-agent",
             run_llama=False,
+            source_filename=str(getattr(upload, "filename", "") or ""),
+            merchant_knowledge_key=str(form.get("merchant_knowledge_key") or ""),
         )
     except DonutUnavailableError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
