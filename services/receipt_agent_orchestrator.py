@@ -23,6 +23,60 @@ from services.receipt_classification import (
     ReceiptClassificationEngine,
     ReceiptClassificationSerializer,
 )
+from services.document_family import (
+    DocumentFamilyContext,
+    DocumentFamilyEngine,
+    DocumentFamilySerializer,
+)
+from services.receipt_grammar import (
+    ReceiptGrammarContext,
+    ReceiptGrammarEngine,
+    ReceiptGrammarSerializer,
+)
+from services.receipt_constraints import (
+    ConstraintEngine,
+    ReceiptConstraintResult,
+    ReceiptConstraintSerializer,
+)
+from services.product_intelligence import (
+    ProductIntelligenceEngine,
+    ProductIntelligenceResult,
+    ProductIntelligenceSerializer,
+)
+from services.enterprise_graph import (
+    EnterpriseGraphContext,
+    EnterpriseGraphEngine,
+    EnterpriseGraphSerializer,
+)
+from services.cross_document_intelligence import (
+    CrossDocumentIntelligenceEngine,
+    CrossDocumentSerializer,
+    IntelligenceResult,
+)
+from services.enterprise_learning import (
+    EnterpriseLearningEngine,
+    EnterpriseLearningResult,
+    EnterpriseLearningSerializer,
+)
+from services.enterprise_reasoning import (
+    EnterpriseReasoningEngine,
+    EnterpriseReasoningSerializer,
+    ReasoningContextBuilder,
+    ReasoningResponse,
+)
+from services.presentation_projection import (
+    BusinessProjection,
+    PresentationProjectionEngine,
+    PresentationProjectionSerializer,
+)
+from services.intelligence_snapshot import (
+    InMemorySnapshotRepository,
+    ReceiptIntelligenceSnapshotEngine,
+    SnapshotSerializer,
+)
+from services.receipt_quality import ReceiptCaptureQualityEngine
+from services.receipt_processing import ReceiptProcessingExperienceEngine, ReceiptProcessingSerializer
+from services.document_review import DocumentFamilyReviewEngine, DocumentReviewSerializer
 
 
 @dataclass
@@ -40,6 +94,15 @@ class ReceiptAgentAttempt:
     receipt_document: ReceiptDocument | None = None
     receipt_structure: ReceiptPhysicalStructure | None = None
     receipt_classification: ReceiptClassification | None = None
+    document_family_context: DocumentFamilyContext | None = None
+    receipt_grammar: ReceiptGrammarContext | None = None
+    receipt_constraint_result: ReceiptConstraintResult | None = None
+    product_intelligence: ProductIntelligenceResult | None = None
+    enterprise_knowledge_graph: EnterpriseGraphContext | None = None
+    cross_document_intelligence: IntelligenceResult | None = None
+    enterprise_learning: EnterpriseLearningResult | None = None
+    enterprise_reasoning: ReasoningResponse | None = None
+    business_projection: BusinessProjection | None = None
 
     def summary(self) -> dict[str, Any]:
         validation = self.semantic.get("validation") or {}
@@ -84,6 +147,32 @@ class ReceiptAgentOrchestrator:
         merchant_intelligence_serializer: MerchantIntelligenceSerializer | None = None,
         receipt_classification_engine: ReceiptClassificationEngine | None = None,
         receipt_classification_serializer: ReceiptClassificationSerializer | None = None,
+        document_family_engine: DocumentFamilyEngine | None = None,
+        document_family_serializer: DocumentFamilySerializer | None = None,
+        receipt_grammar_engine: ReceiptGrammarEngine | None = None,
+        receipt_grammar_serializer: ReceiptGrammarSerializer | None = None,
+        receipt_constraint_engine: ConstraintEngine | None = None,
+        receipt_constraint_serializer: ReceiptConstraintSerializer | None = None,
+        product_intelligence_engine: ProductIntelligenceEngine | None = None,
+        product_intelligence_serializer: ProductIntelligenceSerializer | None = None,
+        enterprise_graph_engine: EnterpriseGraphEngine | None = None,
+        enterprise_graph_serializer: EnterpriseGraphSerializer | None = None,
+        cross_document_intelligence_engine: CrossDocumentIntelligenceEngine | None = None,
+        cross_document_serializer: CrossDocumentSerializer | None = None,
+        enterprise_learning_engine: EnterpriseLearningEngine | None = None,
+        enterprise_learning_serializer: EnterpriseLearningSerializer | None = None,
+        enterprise_reasoning_engine: EnterpriseReasoningEngine | None = None,
+        enterprise_reasoning_serializer: EnterpriseReasoningSerializer | None = None,
+        reasoning_context_builder: ReasoningContextBuilder | None = None,
+        presentation_projection_engine: PresentationProjectionEngine | None = None,
+        presentation_projection_serializer: PresentationProjectionSerializer | None = None,
+        intelligence_snapshot_engine: ReceiptIntelligenceSnapshotEngine | None = None,
+        intelligence_snapshot_serializer: SnapshotSerializer | None = None,
+        capture_quality_engine: ReceiptCaptureQualityEngine | None = None,
+        processing_experience_engine: ReceiptProcessingExperienceEngine | None = None,
+        processing_experience_serializer: ReceiptProcessingSerializer | None = None,
+        document_review_engine: DocumentFamilyReviewEngine | None = None,
+        document_review_serializer: DocumentReviewSerializer | None = None,
     ) -> None:
         self.donut_receipt_service = donut_receipt_service
         self.receipt_image_isolation_service = receipt_image_isolation_service
@@ -98,6 +187,42 @@ class ReceiptAgentOrchestrator:
         self.merchant_intelligence_serializer = merchant_intelligence_serializer or MerchantIntelligenceSerializer()
         self.receipt_classification_engine = receipt_classification_engine or ReceiptClassificationEngine()
         self.receipt_classification_serializer = receipt_classification_serializer or ReceiptClassificationSerializer()
+        self.document_family_engine = document_family_engine or DocumentFamilyEngine()
+        self.document_family_serializer = document_family_serializer or DocumentFamilySerializer()
+        self.receipt_grammar_engine = receipt_grammar_engine or ReceiptGrammarEngine()
+        self.receipt_grammar_serializer = receipt_grammar_serializer or ReceiptGrammarSerializer()
+        self.receipt_constraint_engine = receipt_constraint_engine or ConstraintEngine()
+        self.receipt_constraint_serializer = receipt_constraint_serializer or ReceiptConstraintSerializer()
+        self.product_intelligence_engine = product_intelligence_engine or ProductIntelligenceEngine()
+        self.product_intelligence_serializer = product_intelligence_serializer or ProductIntelligenceSerializer()
+        self.enterprise_graph_engine = enterprise_graph_engine or EnterpriseGraphEngine()
+        self.enterprise_graph_serializer = enterprise_graph_serializer or EnterpriseGraphSerializer()
+        self.cross_document_intelligence_engine = (
+            cross_document_intelligence_engine or CrossDocumentIntelligenceEngine()
+        )
+        self.cross_document_serializer = cross_document_serializer or CrossDocumentSerializer()
+        self.enterprise_learning_engine = enterprise_learning_engine or EnterpriseLearningEngine()
+        self.enterprise_learning_serializer = (
+            enterprise_learning_serializer or EnterpriseLearningSerializer()
+        )
+        self.enterprise_reasoning_engine = (
+            enterprise_reasoning_engine or EnterpriseReasoningEngine()
+        )
+        self.enterprise_reasoning_serializer = (
+            enterprise_reasoning_serializer or EnterpriseReasoningSerializer()
+        )
+        self.reasoning_context_builder = reasoning_context_builder or ReasoningContextBuilder()
+        self.presentation_projection_engine = presentation_projection_engine or PresentationProjectionEngine()
+        self.presentation_projection_serializer = presentation_projection_serializer or PresentationProjectionSerializer()
+        self.intelligence_snapshot_engine = intelligence_snapshot_engine or ReceiptIntelligenceSnapshotEngine(
+            InMemorySnapshotRepository(),
+        )
+        self.intelligence_snapshot_serializer = intelligence_snapshot_serializer or SnapshotSerializer()
+        self.capture_quality_engine = capture_quality_engine
+        self.processing_experience_engine = processing_experience_engine
+        self.processing_experience_serializer = processing_experience_serializer or ReceiptProcessingSerializer()
+        self.document_review_engine = document_review_engine
+        self.document_review_serializer = document_review_serializer or DocumentReviewSerializer()
         self.max_attempts = int(os.getenv("RECEIPT_AGENT_MAX_ATTEMPTS", "3"))
         self.accept_confidence = float(os.getenv("RECEIPT_AGENT_ACCEPT_CONFIDENCE", "0.82"))
         self.review_confidence = float(os.getenv("RECEIPT_AGENT_REVIEW_CONFIDENCE", "0.78"))
@@ -124,6 +249,15 @@ class ReceiptAgentOrchestrator:
         supplied_variants = ocr_variants or []
         merchant_intelligence = self._load_merchant_intelligence(merchant_knowledge_key)
 
+        capture_quality = None
+        if image_bytes and self.capture_quality_engine is not None:
+            capture_quality = self.capture_quality_engine.evaluate(image_bytes)
+            if not capture_quality.passed:
+                response = self._quality_failure_response(capture_quality, parser_json)
+                response = self._attach_document_review(response)
+                return self._attach_processing_experience(response)
+            image_bytes = capture_quality.normalized_image_bytes
+
         image_sources = self._image_sources(image_bytes)
         if not image_sources:
             image_sources = [{"source": "text_only", "strategy": "semantic_text_only", "imageBytes": b"", "diagnostics": {}}]
@@ -147,6 +281,7 @@ class ReceiptAgentOrchestrator:
                     if merchant_intelligence is not None and merchant_intelligence.blueprint is not None
                     else ()
                 ),
+                merchant_knowledge_key=merchant_knowledge_key,
             )
             attempts.append(attempt)
             if self._attempt_is_good_enough(attempt):
@@ -158,6 +293,8 @@ class ReceiptAgentOrchestrator:
             "semantic": best.semantic,
             "llama": best.llama,
         }
+        if capture_quality is not None:
+            response["receiptQuality"] = capture_quality.to_dict()
         if best.receipt_document is not None:
             response["receiptDocument"] = self.receipt_dom_serializer.to_dict(best.receipt_document, debug=True)
         if best.receipt_structure is not None:
@@ -166,17 +303,130 @@ class ReceiptAgentOrchestrator:
             response["receiptClassification"] = self.receipt_classification_serializer.to_dict(
                 best.receipt_classification, debug=True,
             )
+        if best.document_family_context is not None:
+            response["documentFamilyContext"] = self.document_family_serializer.to_dict(
+                best.document_family_context,
+            )
+        if best.receipt_grammar is not None:
+            response["receiptGrammar"] = self.receipt_grammar_serializer.context_to_dict(best.receipt_grammar)
+        if best.receipt_constraint_result is not None:
+            response["receiptConstraintResult"] = self.receipt_constraint_serializer.to_dict(
+                best.receipt_constraint_result,
+            )
+        if best.product_intelligence is not None:
+            response["productIntelligence"] = self.product_intelligence_serializer.to_dict(
+                best.product_intelligence,
+            )
+        if best.enterprise_knowledge_graph is not None:
+            response["enterpriseKnowledgeGraph"] = self.enterprise_graph_serializer.to_dict(
+                best.enterprise_knowledge_graph,
+            )
+        if best.cross_document_intelligence is not None:
+            response["crossDocumentIntelligence"] = self.cross_document_serializer.to_dict(
+                best.cross_document_intelligence,
+            )
+        if best.enterprise_learning is not None:
+            response["enterpriseLearning"] = self.enterprise_learning_serializer.to_dict(
+                best.enterprise_learning,
+            )
+        if best.enterprise_reasoning is not None:
+            response["enterpriseReasoning"] = self.enterprise_reasoning_serializer.to_dict(
+                best.enterprise_reasoning,
+            )
+        if best.business_projection is not None:
+            response["businessProjection"] = self.presentation_projection_serializer.to_dict(
+                best.business_projection,
+            )
         if merchant_intelligence is not None:
             response["merchantIntelligence"] = self.merchant_intelligence_serializer.context_to_dict(merchant_intelligence)
+        response = self._attach_document_review(response)
         agent = self._build_agent_summary(
             attempts=attempts,
             selected=best,
             parser_json=parser_json,
             isolation_diagnostics=[source.get("diagnostics") for source in image_sources if source.get("diagnostics")],
+            document_review=response.get("documentReview"),
         )
         response["receiptAgent"] = agent
         self._attach_agent_metadata(response, agent)
+        response = self._attach_processing_experience(response)
+        snapshot_receipt_id = (
+            best.receipt_document.id if best.receipt_document is not None
+            else source_image_id or source_filename or "anonymous-receipt"
+        )
+        try:
+            snapshot = self.intelligence_snapshot_engine.capture(
+                response,
+                receipt_id=snapshot_receipt_id,
+            )
+            response["receiptIntelligenceSnapshot"] = self.intelligence_snapshot_serializer.to_dict(snapshot)
+            response["snapshotProjection"] = self.intelligence_snapshot_serializer.to_dict(
+                self.intelligence_snapshot_engine.project(snapshot),
+            )
+            response["snapshotHistory"] = self.intelligence_snapshot_serializer.to_dict(
+                self.intelligence_snapshot_engine.history(snapshot_receipt_id),
+            )
+        except Exception as exc:
+            response["receiptIntelligenceSnapshotDiagnostics"] = {
+                "persisted": False,
+                "warning": f"snapshot_capture_failed:{type(exc).__name__}",
+                "parserModified": False,
+                "receiptModified": False,
+            }
         return response
+
+    def _attach_document_review(self, response: dict[str, Any]) -> dict[str, Any]:
+        if self.document_review_engine is None:
+            return response
+        result = self.document_review_engine.review(response)
+        return {**response, "documentReview": self.document_review_serializer.to_dict(result)}
+
+    def _attach_processing_experience(self, response: dict[str, Any]) -> dict[str, Any]:
+        if self.processing_experience_engine is None:
+            return response
+        experience = self.processing_experience_engine.build(response)
+        return {**response, "receiptProcessing": self.processing_experience_serializer.to_dict(experience)}
+
+    @staticmethod
+    def _quality_failure_response(capture_quality: Any, parser_json: dict[str, Any]) -> dict[str, Any]:
+        quality = capture_quality.to_dict()
+        reasons = [
+            {
+                "field": "image",
+                "reason": recommendation.code,
+                "severity": recommendation.severity,
+                "detail": recommendation.message,
+                "action": recommendation.message,
+            }
+            for recommendation in capture_quality.recommendations
+        ]
+        return {
+            "donut": {"available": False, "warning": "capture_quality_gate_failed"},
+            "semantic": dict(parser_json),
+            "llama": None,
+            "receiptQuality": quality,
+            "receiptAgent": {
+                "schemaVersion": "receipt-agent-v1",
+                "status": "quality_failure",
+                "selectedAttempt": None,
+                "attemptCount": 0,
+                "confidence": capture_quality.confidence,
+                "autonomousActions": [],
+                "attempts": [],
+                "humanReview": {
+                    "required": True,
+                    "queue": "capture_quality",
+                    "reviewMode": "recapture",
+                    "priority": "high",
+                    "riskScore": round((1.0 - capture_quality.overall_score) * 100),
+                    "summary": "Capture quality failed. Recapture before OCR.",
+                    "reasons": reasons,
+                    "actionableExplanations": [item.message for item in capture_quality.recommendations],
+                    "suggestedChecks": [item.factor for item in capture_quality.recommendations],
+                },
+                "diagnostics": {"ocrInvoked": False, "parserModified": False},
+            },
+        }
 
     def _load_merchant_intelligence(self, merchant_knowledge_key: str) -> MerchantIntelligenceContext | None:
         """Explicit-key knowledge lookup only; never derives or detects merchant identity."""
@@ -212,6 +462,7 @@ class ReceiptAgentOrchestrator:
         source_image_id: str,
         source_filename: str,
         classification_blueprints: tuple[MerchantBlueprint, ...],
+        merchant_knowledge_key: str,
     ) -> ReceiptAgentAttempt:
         image_bytes = source.get("imageBytes") or b""
         use_ocr_first = self._use_ocr_first_attempt(source, run_llama)
@@ -245,6 +496,23 @@ class ReceiptAgentOrchestrator:
             receipt_structure,
             classification_blueprints,
         )
+        document_family_context = self.document_family_engine.safe_evaluate(
+            receipt_document,
+            receipt_structure,
+            receipt_classification,
+        )
+        receipt_grammar = self.receipt_grammar_engine.safe_evaluate(
+            receipt_document,
+            receipt_structure,
+            receipt_classification,
+            document_family_context=document_family_context,
+        )
+        receipt_constraint_result = self.receipt_constraint_engine.safe_evaluate(
+            receipt_document,
+            receipt_structure,
+            receipt_grammar,
+            document_family_context=document_family_context,
+        )
         donut_json = self.donut_receipt_service.consolidate_receipt_rows(
             donut_json,
             raw_text=next_raw_text,
@@ -268,6 +536,74 @@ class ReceiptAgentOrchestrator:
         semantic = self._prefer_consolidated_receipt_rows(semantic, donut_json)
         semantic = self._reconcile_merchant_confidence(semantic, parser_json=semantic_parser_json)
         semantic = self._reconcile_semantic_item_candidates(semantic)
+        product_intelligence = self.product_intelligence_engine.safe_enrich(
+            tuple(
+                dict(item) for item in (semantic.get("items") or ())
+                if isinstance(item, dict)
+            ),
+            constraint_result=receipt_constraint_result,
+            merchant_key=merchant_knowledge_key,
+            currency=str(semantic.get("currency") or ""),
+        )
+        enterprise_knowledge_graph = self.enterprise_graph_engine.safe_build(
+            product_intelligence,
+            receipt_id=receipt_document.id if receipt_document is not None else (
+                source_image_id or f"attempt-{index}"
+            ),
+            merchant_key=merchant_knowledge_key,
+            receipt_context=dict(semantic),
+        )
+        cross_document_intelligence = self.cross_document_intelligence_engine.safe_analyze(
+            enterprise_knowledge_graph,
+            document_id=receipt_document.id if receipt_document is not None else (
+                source_image_id or f"attempt-{index}"
+            ),
+        )
+        enterprise_learning = self.enterprise_learning_engine.safe_evaluate(
+            cross_document_intelligence,
+        )
+        reasoning_document_id = (
+            receipt_document.id if receipt_document is not None
+            else source_image_id or f"attempt-{index}"
+        )
+        reasoning_context = self.reasoning_context_builder.build(
+            f"reasoning-context:{reasoning_document_id}",
+            constraint_result=(
+                self.receipt_constraint_serializer.to_dict(receipt_constraint_result)
+                if receipt_constraint_result is not None else None
+            ),
+            product_intelligence=(
+                self.product_intelligence_serializer.to_dict(product_intelligence)
+                if product_intelligence is not None else None
+            ),
+            enterprise_graph=(
+                self.enterprise_graph_serializer.to_dict(enterprise_knowledge_graph)
+                if enterprise_knowledge_graph is not None else None
+            ),
+            cross_document_intelligence=(
+                self.cross_document_serializer.to_dict(cross_document_intelligence)
+                if cross_document_intelligence is not None else None
+            ),
+            enterprise_learning=(
+                self.enterprise_learning_serializer.to_dict(enterprise_learning)
+                if enterprise_learning is not None else None
+            ),
+        )
+        enterprise_reasoning = self.enterprise_reasoning_engine.safe_reason(
+            self.enterprise_reasoning_engine.request(
+                "Summarize the validated enterprise evidence for this receipt.",
+                request_id=f"receipt-reasoning:{reasoning_document_id}",
+                allow_llm=False,
+            ),
+            reasoning_context,
+        )
+        business_projection = self.presentation_projection_engine.safe_project(
+            parser=dict(semantic),
+            document_family_context=document_family_context,
+            enterprise_reasoning=enterprise_reasoning,
+            product_intelligence=product_intelligence,
+            document_id=reasoning_document_id,
+        )
         llama = None
         if run_llama:
             llama = await self.llm_service.structure_receipt(
@@ -297,6 +633,15 @@ class ReceiptAgentOrchestrator:
             receipt_document=receipt_document,
             receipt_structure=receipt_structure,
             receipt_classification=receipt_classification,
+            document_family_context=document_family_context,
+            receipt_grammar=receipt_grammar,
+            receipt_constraint_result=receipt_constraint_result,
+            product_intelligence=product_intelligence,
+            enterprise_knowledge_graph=enterprise_knowledge_graph,
+            cross_document_intelligence=cross_document_intelligence,
+            enterprise_learning=enterprise_learning,
+            enterprise_reasoning=enterprise_reasoning,
+            business_projection=business_projection,
         )
 
     def _build_receipt_document(
@@ -1479,8 +1824,9 @@ class ReceiptAgentOrchestrator:
         selected: ReceiptAgentAttempt,
         parser_json: dict[str, Any],
         isolation_diagnostics: list[dict[str, Any]],
+        document_review: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        review_task = self._human_review_task(selected)
+        review_task = ((document_review or {}).get("humanReview") or self._human_review_task(selected))
         return {
             "schemaVersion": "receipt-agent-v1",
             "mode": "bounded_autonomous_receipt_processing",

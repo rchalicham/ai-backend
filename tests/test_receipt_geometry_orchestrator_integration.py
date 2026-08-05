@@ -13,6 +13,29 @@ from services.merchant_intelligence import (
     InMemoryMerchantIntelligenceRepository,
     MerchantBlueprintService,
 )
+from services.receipt_grammar import (
+    GrammarMetadata,
+    GrammarSection,
+    GrammarSectionType,
+    GrammarVersion,
+    ReceiptGrammar,
+    ReceiptGrammarEngine,
+    ReceiptGrammarRepository,
+)
+from services.receipt_constraints import (
+    ConstraintCategory,
+    ConstraintEngine,
+    ConstraintRule,
+    ConstraintVersion,
+    ReceiptConstraint,
+    ReceiptConstraintRepository,
+)
+from services.product_intelligence import (
+    CanonicalProduct,
+    ProductAlias,
+    ProductIntelligenceEngine,
+    ProductRepository,
+)
 
 
 class _Geometry:
@@ -145,7 +168,17 @@ def test_process_exposes_physical_sidecars_without_replacing_existing_result_key
 
     assert set((
         "donut", "semantic", "llama", "receiptAgent", "receiptDocument",
-        "receiptStructure", "receiptClassification",
+        "receiptStructure", "receiptClassification", "documentFamilyContext", "receiptGrammar",
+        "receiptConstraintResult",
+        "productIntelligence",
+        "enterpriseKnowledgeGraph",
+        "crossDocumentIntelligence",
+        "enterpriseLearning",
+        "enterpriseReasoning",
+        "businessProjection",
+        "receiptIntelligenceSnapshot",
+        "snapshotProjection",
+        "snapshotHistory",
     )) <= set(response)
     assert response["semantic"]["items"] == []
     assert response["llama"] is None
@@ -155,6 +188,47 @@ def test_process_exposes_physical_sidecars_without_replacing_existing_result_key
     assert response["receiptClassification"]["candidates"] == []
     assert response["receiptClassification"]["diagnostics"]["usesOcrText"] is False
     assert response["receiptClassification"]["diagnostics"]["affectsExtraction"] is False
+    assert response["documentFamilyContext"]["schema_version"] == "document-family-context-v1"
+    assert response["documentFamilyContext"]["diagnostics"]["affectsExtraction"] is False
+    assert response["documentFamilyContext"]["diagnostics"]["parserAuthorityChanged"] is False
+    assert response["semantic"]["items"] == []
+    assert response["receiptGrammar"]["loaded"] is False
+    assert response["receiptGrammar"]["diagnostics"]["affectsExtraction"] is False
+    assert response["receiptGrammar"]["diagnostics"]["parserAuthorityChanged"] is False
+    assert response["receiptConstraintResult"]["loaded"] is False
+    assert response["receiptConstraintResult"]["diagnostics"]["affectsExtraction"] is False
+    assert response["receiptConstraintResult"]["diagnostics"]["parserAuthorityChanged"] is False
+    assert response["productIntelligence"]["enrichments"] == []
+    assert response["productIntelligence"]["diagnostics"]["affects_extraction"] is False
+    assert response["productIntelligence"]["diagnostics"]["parser_authority_changed"] is False
+    assert response["enterpriseKnowledgeGraph"]["diagnostics"]["affects_extraction"] is False
+    assert response["enterpriseKnowledgeGraph"]["diagnostics"]["parser_authority_changed"] is False
+    assert response["enterpriseKnowledgeGraph"]["diagnostics"]["storage_write_performed"] is False
+    assert response["crossDocumentIntelligence"]["diagnostics"]["affects_extraction"] is False
+    assert response["crossDocumentIntelligence"]["diagnostics"]["parser_authority_changed"] is False
+    assert response["crossDocumentIntelligence"]["diagnostics"]["documents_modified"] is False
+    assert response["crossDocumentIntelligence"]["diagnostics"]["graph_modified"] is False
+    assert response["enterpriseLearning"]["diagnostics"]["affects_extraction"] is False
+    assert response["enterpriseLearning"]["diagnostics"]["parser_authority_changed"] is False
+    assert response["enterpriseLearning"]["diagnostics"]["production_knowledge_modified"] is False
+    assert response["enterpriseLearning"]["diagnostics"]["automatic_approval_performed"] is False
+    assert response["enterpriseLearning"]["diagnostics"]["raw_ocr_consumed"] is False
+    assert response["enterpriseLearning"]["snapshot"]["approvals"] == []
+    assert response["enterpriseReasoning"]["diagnostics"]["affects_extraction"] is False
+    assert response["enterpriseReasoning"]["diagnostics"]["parser_authority_changed"] is False
+    assert response["businessProjection"]["schema_version"] == "business-projection-v1"
+    assert response["businessProjection"]["diagnostics"]["parser_modified"] is False
+    assert response["businessProjection"]["diagnostics"]["parser_authority_changed"] is False
+    assert response["receiptIntelligenceSnapshot"]["schema_version"] == "receipt-intelligence-snapshot-v1"
+    assert response["receiptIntelligenceSnapshot"]["diagnostics"]["parser_modified"] is False
+    assert response["receiptIntelligenceSnapshot"]["diagnostics"]["receipt_modified"] is False
+    assert response["snapshotProjection"]["version"] == 1
+    assert len(response["snapshotHistory"]["snapshots"]) == 1
+    assert response["enterpriseReasoning"]["diagnostics"]["raw_ocr_consumed"] is False
+    assert response["enterpriseReasoning"]["diagnostics"]["parser_guesses_consumed"] is False
+    assert response["enterpriseReasoning"]["diagnostics"]["llm_bypassed_evidence"] is False
+    assert response["enterpriseReasoning"]["diagnostics"]["llm_used"] is False
+    assert response["enterpriseReasoning"]["decision"]["authoritative"] is False
 
 
 def test_explicit_merchant_knowledge_is_request_context_only_and_does_not_change_semantic_result():
@@ -188,3 +262,164 @@ def test_explicit_merchant_knowledge_is_request_context_only_and_does_not_change
     assert response["merchantIntelligence"]["blueprint"]["identity"]["canonical_name"] == "Knowledge Fixture"
     assert response["merchantIntelligence"]["diagnostics"]["detectionPerformed"] is False
     assert response["merchantIntelligence"]["diagnostics"]["affectsExtraction"] is False
+
+
+def test_matching_receipt_grammar_is_additive_and_does_not_change_existing_extraction():
+    knowledge_repository = InMemoryMerchantIntelligenceRepository()
+    blueprints = MerchantBlueprintService(knowledge_repository)
+    blueprints.create_blueprint("merchant-grammar-1", "Grammar Fixture")
+    blueprints.add_receipt_family(
+        "merchant-grammar-1",
+        "family-grammar-1",
+        "Grammar Family",
+        confidence=1.0,
+        attributes=(("physical_features", {"page": {"width": 400.0, "height": 800.0}}),),
+    )
+    grammar_repository = ReceiptGrammarRepository()
+    grammar_repository.save_grammar(ReceiptGrammar(
+        metadata=GrammarMetadata(
+            "grammar-family-grammar-1",
+            "family-grammar-1",
+            "Grammar Family Definition",
+        ),
+        version=GrammarVersion(),
+        sections=(
+            GrammarSection(
+                "header",
+                GrammarSectionType.HEADER,
+                "Header",
+                required=True,
+                minimum_occurrences=1,
+            ),
+        ),
+    ))
+    constraint_repository = ReceiptConstraintRepository()
+    constraint_repository.save_constraints(ReceiptConstraint(
+        constraint_set_id="constraints-family-grammar-1",
+        receipt_family="family-grammar-1",
+        name="Grammar Family Constraints",
+        version=ConstraintVersion(),
+        rules=(
+            ConstraintRule(
+                "grammar-compliance",
+                ConstraintCategory.GRAMMAR,
+                "grammar_compliance",
+                "Grammar compliance must be structurally supported.",
+                parameters=(("minimum", 0.0),),
+            ),
+        ),
+    ))
+    agent = _SingleSourceAgent(
+        donut_receipt_service=_Donut(),
+        receipt_image_isolation_service=_Isolation(),
+        receipt_ocr_service=object(),
+        llm_service=_Llm(),
+        receipt_geometry_engine=_PhysicalGeometryEngine(),
+        merchant_blueprint_service=blueprints,
+        receipt_grammar_engine=ReceiptGrammarEngine(repository=grammar_repository),
+        receipt_constraint_engine=ConstraintEngine(repository=constraint_repository),
+    )
+    request = dict(
+        image_bytes=b"source",
+        raw_text="ALPHA",
+        lines=["ALPHA"],
+        ocr_blocks=[
+            {
+                "text": "ALPHA",
+                "x": 20,
+                "y": 30,
+                "width": 60,
+                "height": 15,
+                "block": 1,
+                "line": 1,
+            },
+        ],
+        run_llama=False,
+    )
+
+    baseline = asyncio.run(agent.process(**request))
+    response = asyncio.run(
+        agent.process(**request, merchant_knowledge_key="merchant-grammar-1"),
+    )
+
+    assert response["semantic"] == baseline["semantic"]
+    assert response["donut"] == baseline["donut"]
+    assert response["llama"] == baseline["llama"]
+    assert response["receiptGrammar"]["loaded"] is True
+    assert response["receiptGrammar"]["receipt_family"] == "family-grammar-1"
+    assert response["receiptGrammar"]["grammar"]["metadata"]["grammar_id"] == "grammar-family-grammar-1"
+    assert response["receiptGrammar"]["compilation"]["diagnostics"]["valid"] is True
+    assert response["receiptGrammar"]["diagnostics"]["affectsExtraction"] is False
+    assert response["receiptGrammar"]["diagnostics"]["parserAuthorityChanged"] is False
+    assert response["receiptConstraintResult"]["loaded"] is True
+    assert response["receiptConstraintResult"]["receipt_family"] == "family-grammar-1"
+    assert response["receiptConstraintResult"]["decision"]["best_candidate"]["candidate_id"] == "grammar-structure-candidate"
+    assert response["receiptConstraintResult"]["diagnostics"]["affectsExtraction"] is False
+    assert response["receiptConstraintResult"]["diagnostics"]["parserAuthorityChanged"] is False
+    assert response["receiptConstraintResult"]["diagnostics"]["businessFactsGenerated"] is False
+
+
+def test_product_intelligence_enriches_a_copy_and_does_not_change_parser_output():
+    class _ItemPipeline(_PhysicalPipeline):
+        def to_structured_json(self, **kwargs):
+            return {
+                "items": [{"name": "MLK 2%", "price": "3.49", "quantity": 1}],
+                "facts": {"total": "3.49"},
+                "confidence": {"overall": 0.9},
+            }
+
+    class _ItemLlm:
+        receipt_intelligence = _ItemPipeline()
+
+    products = ProductRepository()
+    products.saveProducts(CanonicalProduct(
+        product_id="milk",
+        canonical_name="Milk",
+        aliases=(ProductAlias("MLK 2%", "Milk 2 Percent"),),
+    ))
+    agent = _SingleSourceAgent(
+        donut_receipt_service=_Donut(),
+        receipt_image_isolation_service=_Isolation(),
+        receipt_ocr_service=object(),
+        llm_service=_ItemLlm(),
+        receipt_geometry_engine=_PhysicalGeometryEngine(),
+        product_intelligence_engine=ProductIntelligenceEngine(repository=products),
+    )
+
+    response = asyncio.run(agent.process(
+        image_bytes=b"source",
+        raw_text="MLK 2% 3.49",
+        lines=["MLK 2% 3.49"],
+        ocr_blocks=[{
+            "text": "MLK 2% 3.49", "x": 20, "y": 30,
+            "width": 100, "height": 15, "block": 1, "line": 1,
+        }],
+        run_llama=False,
+    ))
+
+    assert response["semantic"]["items"] == [
+        {"name": "MLK 2%", "price": "3.49", "quantity": 1},
+    ]
+    context = response["crossDocumentIntelligence"]
+    assert context["schema_version"] == "cross-document-intelligence-v1"
+    assert context["memory"]["deterministic"] is True
+    assert context["memory"]["llm_memory"] is False
+    assert context["diagnostics"]["machine_learning_used"] is False
+    assert context["diagnostics"]["memory_write_performed"] is False
+    enrichment = response["productIntelligence"]["enrichments"][0]
+    assert enrichment["original_description"] == "MLK 2%"
+    assert enrichment["normalized_description"] == "Milk 2 Percent"
+    assert enrichment["canonical_product"]["canonical_name"] == "Milk"
+    assert response["productIntelligence"]["diagnostics"]["affects_extraction"] is False
+    assert response["productIntelligence"]["diagnostics"]["extracted_values_replaced"] is False
+    graph = response["enterpriseKnowledgeGraph"]
+    assert graph["schema_version"] == "enterprise-graph-context-v1"
+    assert any(
+        node["entity"]["entity_type"] == "Product"
+        and node["entity"]["label"] == "Milk"
+        for node in graph["graph"]["nodes"]
+    )
+    assert all(edge["relationship"]["explanation"] for edge in graph["graph"]["edges"])
+    assert response["semantic"]["items"] == [
+        {"name": "MLK 2%", "price": "3.49", "quantity": 1},
+    ]

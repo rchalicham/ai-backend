@@ -116,3 +116,6 @@ pytest -q tests/test_receipt_geometry.py \
 
 The tests use synthetic images and never invoke OCR, parsers, models, merchant
 logic, network services, or LLMs.
+# Validation boundary
+
+`ReceiptGeometryEngine` publishes observations. Consumers that make blocking quality decisions must pass those observations through `services.geometry_validation.GeometryValidationEngine`. Raw contour coordinates and perspective matrices are not authoritative until validated.

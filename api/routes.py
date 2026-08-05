@@ -20,11 +20,23 @@ from services.receipt_agent_orchestrator import ReceiptAgentOrchestrator
 from services.receipt_image_isolation import ReceiptImageIsolationService
 from services.receipt_geometry import ReceiptGeometryEngine
 from services.receipt_ocr_service import ReceiptOcrService
+from services.receipt_quality import FileEnterpriseConfigurationProvider, QualityPolicyLoader, ReceiptCaptureQualityEngine
+from services.receipt_processing import ProcessingExperienceConfigurationLoader, ReceiptProcessingExperienceEngine, ReceiptProcessingSerializer
+from services.document_review import DocumentReviewConfigurationLoader, DocumentFamilyReviewEngine, DocumentReviewSerializer
 from services.merchant_intelligence import (
     InMemoryMerchantIntelligenceRepository,
     MerchantBlueprintService,
     MongoMerchantIntelligenceRepository,
 )
+from services.document_family import DocumentFamilyQualityRunner, quality_report_to_dict
+from services.intelligence_snapshot import (
+    InMemorySnapshotRepository,
+    MongoSnapshotRepository,
+    ReceiptIntelligenceSnapshotEngine,
+    SnapshotSerializer,
+)
+from api.expense_routes import attach_expense_intelligence
+from api.household_routes import attach_household_intelligence
 
 
 router = APIRouter()
@@ -36,6 +48,20 @@ donut_receipt_service = DonutReceiptService()
 receipt_image_isolation_service = ReceiptImageIsolationService()
 receipt_geometry_engine = ReceiptGeometryEngine()
 receipt_ocr_service = ReceiptOcrService()
+capture_quality_configuration_path = os.getenv(
+    "ENTERPRISE_RECEIPT_QUALITY_CONFIGURATION",
+    os.path.join(os.path.dirname(os.path.dirname(__file__)), "config", "receipt_capture_quality.json"),
+)
+capture_quality_engine = ReceiptCaptureQualityEngine(
+    QualityPolicyLoader(FileEnterpriseConfigurationProvider(capture_quality_configuration_path)),
+    receipt_geometry_engine,
+)
+processing_experience_engine = ReceiptProcessingExperienceEngine(
+    ProcessingExperienceConfigurationLoader(FileEnterpriseConfigurationProvider(capture_quality_configuration_path)),
+)
+document_review_engine = DocumentFamilyReviewEngine(
+    DocumentReviewConfigurationLoader(FileEnterpriseConfigurationProvider(capture_quality_configuration_path)),
+)
 merchant_intelligence_uri = os.getenv("MERCHANT_INTELLIGENCE_MONGO_URI", "").strip()
 merchant_intelligence_repository = (
     MongoMerchantIntelligenceRepository.from_uri(
@@ -46,6 +72,18 @@ merchant_intelligence_repository = (
     else InMemoryMerchantIntelligenceRepository()
 )
 merchant_blueprint_service = MerchantBlueprintService(merchant_intelligence_repository)
+snapshot_serializer = SnapshotSerializer()
+snapshot_uri = os.getenv("INTELLIGENCE_SNAPSHOT_MONGO_URI", os.getenv("MONGO_URI", "")).strip()
+snapshot_repository = (
+    MongoSnapshotRepository.from_uri(
+        snapshot_uri,
+        os.getenv("INTELLIGENCE_SNAPSHOT_DATABASE", "receipt_intelligence"),
+        os.getenv("INTELLIGENCE_SNAPSHOT_COLLECTION", "snapshots"),
+    )
+    if snapshot_uri else InMemorySnapshotRepository()
+)
+intelligence_snapshot_engine = ReceiptIntelligenceSnapshotEngine(snapshot_repository)
+document_family_quality_runner = DocumentFamilyQualityRunner()
 receipt_agent_orchestrator = ReceiptAgentOrchestrator(
     donut_receipt_service=donut_receipt_service,
     receipt_image_isolation_service=receipt_image_isolation_service,
@@ -53,7 +91,48 @@ receipt_agent_orchestrator = ReceiptAgentOrchestrator(
     receipt_geometry_engine=receipt_geometry_engine,
     merchant_blueprint_service=merchant_blueprint_service,
     llm_service=llm_service,
+    intelligence_snapshot_engine=intelligence_snapshot_engine,
+    intelligence_snapshot_serializer=snapshot_serializer,
+    capture_quality_engine=capture_quality_engine,
+    processing_experience_engine=processing_experience_engine,
+    processing_experience_serializer=ReceiptProcessingSerializer(),
+    document_review_engine=document_review_engine,
+    document_review_serializer=DocumentReviewSerializer(),
 )
+
+
+@router.get("/receipt/intelligence-snapshots/{receipt_id}/latest")
+def latest_intelligence_snapshot(receipt_id: str):
+    snapshot = intelligence_snapshot_engine.latest(receipt_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Snapshot not found.")
+    return snapshot_serializer.to_dict(snapshot)
+
+
+@router.get("/receipt/quality/document-families")
+def document_family_quality():
+    return quality_report_to_dict(document_family_quality_runner.run())
+
+
+@router.get("/receipt/intelligence-snapshots/{receipt_id}/history")
+def intelligence_snapshot_history(receipt_id: str):
+    return snapshot_serializer.to_dict(intelligence_snapshot_engine.history(receipt_id))
+
+
+@router.get("/receipt/intelligence-snapshot/{snapshot_id}")
+def intelligence_snapshot(snapshot_id: str):
+    snapshot = intelligence_snapshot_engine.load(snapshot_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Snapshot not found.")
+    return snapshot_serializer.to_dict(snapshot)
+
+
+@router.get("/receipt/intelligence-snapshots/compare/{before_id}/{after_id}")
+def compare_intelligence_snapshots(before_id: str, after_id: str):
+    try:
+        return snapshot_serializer.to_dict(intelligence_snapshot_engine.compare(before_id, after_id))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Snapshot not found.") from exc
 
 
 @router.post("/index")
@@ -203,7 +282,7 @@ async def receipt_document_understanding(payload: ReceiptDocumentUnderstandingRe
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Unable to fetch or process receipt image: {exc}") from exc
     try:
-        return await receipt_agent_orchestrator.process(
+        result = await receipt_agent_orchestrator.process(
             image_bytes=image_bytes,
             raw_text=payload.raw_text,
             lines=payload.lines,
@@ -214,6 +293,7 @@ async def receipt_document_understanding(payload: ReceiptDocumentUnderstandingRe
             run_llama=payload.run_llama,
             merchant_knowledge_key=payload.merchant_knowledge_key,
         )
+        return attach_household_intelligence(attach_expense_intelligence(result))
     except DonutUnavailableError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
@@ -234,7 +314,7 @@ async def receipt_document_understanding_upload(request: Request):
     lines = [line for line in raw_text.splitlines() if line.strip()]
     ocr_blocks = []
     try:
-        return await receipt_agent_orchestrator.process(
+        result = await receipt_agent_orchestrator.process(
             image_bytes=image_bytes,
             raw_text=raw_text,
             lines=lines,
@@ -245,6 +325,7 @@ async def receipt_document_understanding_upload(request: Request):
             source_filename=str(getattr(upload, "filename", "") or ""),
             merchant_knowledge_key=str(form.get("merchant_knowledge_key") or ""),
         )
+        return attach_household_intelligence(attach_expense_intelligence(result))
     except DonutUnavailableError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:

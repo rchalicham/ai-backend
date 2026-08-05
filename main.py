@@ -4,6 +4,8 @@ from fastapi import FastAPI
 
 from api.routes import router as api_router
 from api.routes import llm_service
+from api.expense_routes import router as expense_router
+from api.household_routes import router as household_router
 
 
 app = FastAPI(
@@ -22,6 +24,10 @@ def health() -> dict[str, str]:
 
 app.include_router(api_router, prefix="/api")
 app.include_router(api_router)
+app.include_router(expense_router, prefix="/api")
+app.include_router(expense_router)
+app.include_router(household_router, prefix="/api")
+app.include_router(household_router)
 
 
 @app.on_event("startup")
